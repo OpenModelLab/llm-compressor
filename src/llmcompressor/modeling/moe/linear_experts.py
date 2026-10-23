@@ -589,9 +589,10 @@ class LinearExperts2D(torch.nn.ModuleList):
             expert_weights = top_k_weights[expert_tokens, expert_slots, None]
             weighted_output = expert_output * expert_weights
 
-            # Experts run in index order. Within an expert, tokens stay in the
-            # slot-major where-scan order so repeated hits accumulate the same way.
-            final_hidden_states.index_add_(
+            # Make the dependency on each expert explicit to FX. An in-place
+            # update can be reordered after consumers or lost across offloaded
+            # sequential partitions, which hold separate copies of this tensor.
+            final_hidden_states = final_hidden_states.index_add(
                 0, expert_tokens, weighted_output.to(final_hidden_states.dtype)
             )
 

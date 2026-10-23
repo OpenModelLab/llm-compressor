@@ -11,6 +11,7 @@ from compressed_tensors import ModelCompressor, SparsityCompressionConfig
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.distributed import is_source_process
 from compressed_tensors.offload import OffloadCache, from_accelerate, to_accelerate
+from compressed_tensors.offload.cache import DiskCache
 from compressed_tensors.quantization import QuantizationConfig
 from compressed_tensors.utils import deprecated
 from huggingface_hub import hf_hub_download
@@ -170,6 +171,19 @@ def modify_save_pretrained(model: PreTrainedModel):
             # tied-parameter bookkeeping consistent.
             _retie_embeddings(model)
 
+            # CT's accelerate disk index is built from state_dict, which omits
+            # nonpersistent buffers (e.g. GLM rotary inv_freq). Retain those small
+            # runtime buffers on the source so conversion back cannot strand them
+            # on meta after saving. Parameters stay offloaded throughout.
+            runtime_buffers = []
+            if is_source_process():
+                for module in model.modules():
+                    if isinstance(module._buffers, DiskCache):
+                        for name in module._non_persistent_buffers_set:
+                            value = getattr(module, name, None)
+                            if value is not None:
+                                runtime_buffers.append((module, name, value.cpu()))
+
             # convert to accelerate offloaded for optimal saving with transformers
             to_accelerate(model)
 
@@ -198,6 +212,8 @@ def modify_save_pretrained(model: PreTrainedModel):
                         save_mtp_tensors(model, save_dir, source_mtp=source_mtp)
 
             # convert back from accelerate to restore model to original form
+            for module, name, value in runtime_buffers:
+                module._buffers[name] = value
             from_accelerate(model)
 
         save_pretrained_wrapper._overridden = True
@@ -299,8 +315,7 @@ def resave_config(config: PretrainedConfig, save_dir: str):
     sometimes supports loading the transformers-serialized one. To stay
     compatible, this loads the original config file referenced by
     ``config._name_or_path``, overwrites only the fields that llmcompressor has
-    changed (currently the expert-count fields in
-    :data:`NUM_EXPERTS_CONFIG_KEYS`, which change under REAP expert pruning),
+    changed (dtype, tied embeddings, expert counts and precision-transform state),
     and writes the result to ``save_dir/config.json``.
 
     :param config: the (possibly modified) model config, used both to locate the
@@ -372,6 +387,12 @@ def resave_config(config: PretrainedConfig, save_dir: str):
             "Failed to modify config. Keeping the transformers-serialized config."
         )
         return
+
+    # Transform completion markers and diagnostics are added after model loading.
+    # Dropping them here would let a reloaded model apply the transforms twice.
+    for key in ("quarot_config", "flex_smooth_config"):
+        if key in src_config:
+            tgt_config[key] = src_config[key]
 
     save_path = os.path.join(save_dir, "config.json")
     with open(save_path, "w") as file:
