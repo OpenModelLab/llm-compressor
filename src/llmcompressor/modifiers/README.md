@@ -45,6 +45,11 @@ to calculate a Hessian for each layers input activations, this Hessian is then u
 solve a regression problem that minimizes the error introduced by a given quantization configuration. This algorithm 
 has a good amount of memory overhead introduced by storing the Hessians.
 
+### [SSZ](./quantization/ssz/README.md)
+Fits symmetric INT4/INT8 per-channel weight scales with iterative least-squares
+optimization. Use `SSZModifier` as the quantization stage in a Python recipe;
+weight-only and dynamic activation schemes require no calibration dataset.
+
 ## "Helper" Modifiers
 
 These modifiers do not introduce sparsity or quantization themselves, but are used 
