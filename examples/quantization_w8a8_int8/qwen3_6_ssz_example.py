@@ -1,0 +1,67 @@
+"""SSZ + dynamic W8A8 for dense Qwen3.6-27B.
+
+Set the model and output paths below before running this example.
+SSZ optimizes weight scales without a calibration dataset.
+"""
+
+from importlib.util import find_spec
+from pathlib import Path
+
+import torch
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization.ssz import SSZModifier
+from llmcompressor.utils import load_context
+
+MODEL_ID = "Qwen/Qwen3.6-27B"
+SAVE_DIR = "Qwen3.6-27B-SSZ-W8A8"
+STEP = 50
+
+
+def main():
+    if Path(SAVE_DIR).resolve() == Path(MODEL_ID).resolve():
+        raise ValueError("SAVE_DIR must differ from the original model directory")
+
+    # Quantize text projections and selected linear-attention and vision layers.
+    recipe = [
+        SSZModifier(
+            targets=[
+                r"re:.*self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
+                r"re:.*mlp\.(gate_proj|up_proj|down_proj)$",
+                r"re:.*linear_attn\.(in_proj_qkv|in_proj_z)$",
+                r"re:.*visual\.blocks\.\d+\.attn\.(qkv|proj)$",
+                r"re:.*visual\.blocks\.\d+\.mlp\.linear_fc1$",
+            ],
+            scheme="W8A8",
+            step=STEP,
+        ),
+    ]
+
+    # Register the Ascend backend when installed; CUDA needs no extra import.
+    if find_spec("torch_npu") is not None:
+        import torch_npu  # noqa: F401
+
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    # Keep weights on CPU; the native lifecycle onloads them for quantization.
+    with load_context(Qwen3_5ForConditionalGeneration):
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            MODEL_ID,
+            dtype=torch.bfloat16,
+            device_map="cpu",
+            attn_implementation="eager",
+        )
+    model.eval()
+
+    oneshot(
+        model=model,
+        processor=processor,
+        recipe=recipe,
+        pipeline="independent",
+        save_compressed=True,
+        output_dir=SAVE_DIR,
+    )
+
+
+if __name__ == "__main__":
+    main()
