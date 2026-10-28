@@ -43,6 +43,14 @@ pipeline. See the [Qwen3.6 example](../../../../../examples/quantization_w8a8_in
 for the IterSmooth-style loading pattern, with targets covering text projections
 and selected linear-attention and vision layers.
 
+The Qwen3.6 SSZ-only example snapshots the original offset RMSNorm weights and
+restores them through the offload API before saving. This avoids rounding changes
+from the shared calibration context's BF16 gamma conversion. Saving is deliberately
+separate from `oneshot`; passing an output directory there would save before the
+restoration. This safeguard belongs to that example and must not be used to undo
+intentional norm changes in a smoothing recipe. Other direct `oneshot` entrypoints
+must account for the shared context separately.
+
 ## Algorithm and compatibility
 
 The source is `msmodelslim/core/quantizer/impl/ssz.py`, commit
