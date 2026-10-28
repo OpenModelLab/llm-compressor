@@ -8,14 +8,16 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import torch
+from compressed_tensors.offload import update_offload_parameter
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization.ssz import SSZModifier
 from llmcompressor.utils import load_context
 
 MODEL_ID = "Qwen/Qwen3.6-27B"
-SAVE_DIR = "Qwen3.6-27B-SSZ-W8A8"
+SAVE_DIR = "Qwen3.6_27B_SSZ_W8A8"
 STEP = 50
 
 
@@ -53,14 +55,27 @@ def main():
         )
     model.eval()
 
-    oneshot(
-        model=model,
-        processor=processor,
-        recipe=recipe,
-        pipeline="independent",
-        save_compressed=True,
-        output_dir=SAVE_DIR,
-    )
+    # SSZ only fits Linear weight scales. Preserve offset norms across the native
+    # calibration context's BF16 gamma conversion; no smoothing is performed here.
+    norm_weights = {
+        name: module.weight.detach().cpu().clone()
+        for name, module in model.named_modules()
+        if isinstance(module, Qwen3_5RMSNorm)
+    }
+    try:
+        oneshot(
+            model=model,
+            processor=processor,
+            recipe=recipe,
+            pipeline="independent",
+        )
+    finally:
+        for name, weight in norm_weights.items():
+            update_offload_parameter(model.get_submodule(name), "weight", weight)
+
+    # Save only after restoring the original norms to persistent offload storage.
+    model.save_pretrained(SAVE_DIR, save_compressed=True)
+    processor.save_pretrained(SAVE_DIR)
 
 
 if __name__ == "__main__":
