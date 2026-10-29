@@ -2,6 +2,7 @@
 
 Set the model and output paths below before running this example.
 SSZ optimizes weight scales without a calibration dataset.
+The vision tower stays in BF16 for an accuracy-first configuration.
 """
 
 from importlib.util import find_spec
@@ -25,15 +26,13 @@ def main():
     if Path(SAVE_DIR).resolve() == Path(MODEL_ID).resolve():
         raise ValueError("SAVE_DIR must differ from the original model directory")
 
-    # Quantize text projections and selected linear-attention and vision layers.
+    # Quantize text projections; vision layers are not targeted and stay in BF16.
     recipe = [
         SSZModifier(
             targets=[
                 r"re:.*self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
                 r"re:.*mlp\.(gate_proj|up_proj|down_proj)$",
                 r"re:.*linear_attn\.(in_proj_qkv|in_proj_z)$",
-                r"re:.*visual\.blocks\.\d+\.attn\.(qkv|proj)$",
-                r"re:.*visual\.blocks\.\d+\.mlp\.linear_fc1$",
             ],
             scheme="W8A8",
             step=STEP,

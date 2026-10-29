@@ -65,7 +65,8 @@ def test_python_recipe_and_loading(monkeypatch):
     assert isinstance(modifier, SSZModifier)
     assert modifier.scheme == "W8A8"
     assert modifier.step == example.STEP
-    assert len(modifier.targets) == 5
+    assert not modifier.ignore
+    assert len(modifier.targets) == 3
     weights = modifier.resolved_config.config_groups["group_0"].weights
     assert weights.observer == "ssz"
 
@@ -118,6 +119,12 @@ def test_example_preserves_qwen_offset_norms_in_checkpoint(tmp_path, monkeypatch
                 module.weight.fill_(0.003)
             original_norms[name + ".weight"] = module.weight.detach().clone()
     assert original_norms
+    original_vision = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if name.startswith("model.visual.")
+    }
+    assert original_vision
     source = tmp_path / "source"
     model.save_pretrained(source)
     tokenizer = PreTrainedTokenizerFast(
@@ -143,3 +150,11 @@ def test_example_preserves_qwen_offset_norms_in_checkpoint(tmp_path, monkeypatch
         prefix = "model.language_model.layers.0.self_attn.q_proj."
         assert saved.get_tensor(prefix + "weight").dtype == torch.int8
         assert torch.isfinite(saved.get_tensor(prefix + "weight_scale")).all()
+        for name, original in original_vision.items():
+            vision_value = saved.get_tensor(name)
+            assert vision_value.dtype == original.dtype, name
+            assert torch.equal(vision_value, original), name
+        assert not any(
+            name.startswith("model.visual.") and name.endswith(".weight_scale")
+            for name in saved.keys()
+        )

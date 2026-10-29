@@ -40,8 +40,8 @@ SSZ is the quantization stage, so it replaces `QuantizationModifier` in a Python
 recipe. Preprocessing modifiers can precede it with `pipeline="independent"`.
 Static activation quantization still needs a dataset and its normal calibration
 pipeline. See the [Qwen3.6 example](../../../../../examples/quantization_w8a8_int8/qwen3_6_ssz_example.py)
-for the IterSmooth-style loading pattern, with targets covering text projections
-and selected linear-attention and vision layers.
+for the IterSmooth-style loading pattern, with text and selected linear-attention
+targets. Vision layers are not targeted and retain their original BF16 weights.
 
 The Qwen3.6 SSZ-only example snapshots the original offset RMSNorm weights and
 restores them through the offload API before saving. This avoids rounding changes
@@ -50,6 +50,13 @@ separate from `oneshot`; passing an output directory there would save before the
 restoration. This safeguard belongs to that example and must not be used to undo
 intentional norm changes in a smoothing recipe. Other direct `oneshot` entrypoints
 must account for the shared context separately.
+
+The Qwen example selects only text projections, so no vision-specific ignore
+configuration is needed. To quantize vision projections, add explicit vision
+targets and use a separate output directory. Requantize from the original BF16
+checkpoint: changing metadata on an
+existing INT8 model does not restore its source weights.
+Any accuracy benefit must be measured with the same inference and evaluation setup.
 
 ## Algorithm and compatibility
 
