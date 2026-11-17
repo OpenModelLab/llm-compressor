@@ -1,28 +1,36 @@
 """
 FlatQuant: learnable Kronecker-factored activation transforms, as described
-in https://arxiv.org/pdf/2502.09796 (ported from msmodelslim).
+in https://arxiv.org/abs/2410.09426 (ported from msmodelslim).
 """
 
 import inspect
 from dataclasses import dataclass, field
 
 import torch
+from compressed_tensors import TRANSFORM_CONFIG_NAME
 from compressed_tensors.offload.dist_utils import is_distributed
-from compressed_tensors.quantization import DynamicType
+from compressed_tensors.transform import (
+    TransformArgs,
+    TransformConfig,
+    TransformScheme,
+    apply_transform_config,
+)
 from compressed_tensors.utils import (
     align_modules,
+    find_unique_name,
     get_execution_device,
     match_modules_set,
     update_offload_parameter,
 )
 from loguru import logger
-from pydantic import ConfigDict, PrivateAttr, field_validator
+from pydantic import ConfigDict, Field, PrivateAttr, field_validator
 from torch.nn import Module, Parameter
 from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
 from llmcompressor.core import Event, State, active_session
 from llmcompressor.modifiers import Modifier
+from llmcompressor.modifiers.quantization import QuantizationMixin
 from llmcompressor.modifiers.transform.awq.base import (
     get_lowest_common_ancestor_with_avoid,
 )
@@ -35,7 +43,6 @@ from llmcompressor.modifiers.transform.flatquant.components import (
 )
 from llmcompressor.modifiers.transform.flatquant.mappings import (
     ATTN_LINEAR_LINEAR,
-    MLP_LINEAR_LINEAR,
     NORM_LINEAR,
     FlatQuantMapping,
     ResolvedFlatQuantMapping,
@@ -49,11 +56,11 @@ from llmcompressor.modifiers.transform.flatquant.patch import (
     FlatQuantState,
     get_patched_modules,
     patch_flatquant_linear,
-    patch_flatquant_norm,
     register_flatquant_trans,
     set_flatquant_mode,
     unpatch_flatquant_module,
 )
+from llmcompressor.modifiers.transform.flatquant.runtime import FlatQuantInputTransform
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.pipelines.cache import IntermediatesCache
@@ -75,7 +82,9 @@ def _is_ancestor_name(ancestor: str, descendant: str) -> bool:
     Return True if the module name ``ancestor`` refers to an ancestor of (or
     the same module as) the module named ``descendant``.
     """
-    return descendant == ancestor or descendant.startswith(ancestor + ".")
+    return (
+        not ancestor or descendant == ancestor or descendant.startswith(ancestor + ".")
+    )
 
 
 @dataclass
@@ -95,7 +104,7 @@ class TrainingUnit:
     :param parent_name: name of the parent module
     :param mappings: resolved mappings merged into this unit
     :param modules: all patched modules below parent, refreshed after
-        patching (norms and linears carrying a FlatQuantState)
+        patching (linears carrying a FlatQuantState)
     """
 
     parent: Module
@@ -107,28 +116,30 @@ class TrainingUnit:
 class FlatQuantModifier(Modifier):
     """
     Implements the FlatQuant algorithm, as described in
-    https://arxiv.org/pdf/2502.09796, ported from msmodelslim.
+    https://arxiv.org/abs/2410.09426, ported from msmodelslim.
 
     For each supported structure pair (norm -> linears, v_proj -> o_proj,
-    up_proj -> down_proj), a learnable transform ``A = kron(L, R) * diag(d)``
-    is applied online to the activations feeding the pair's target linears,
+    up_proj -> down_proj), a learnable row-vector transform
+    ``A = diag(d) @ kron(L, R)`` is applied to the target Linear inputs,
     while ``A^-T`` is applied to the target weights. The transform parameters
     (orthogonal Kronecker factors, learnable diagonal, activation/weight clip
     factors) are optimized with a per-layer MSE loss against the fp outputs of
-    the layer, using the cached calibration data. After training, the weight
-    transforms are absorbed (in fp64) into the target weights, the diagonal is
-    absorbed into the source module's weight, and the remaining online factors
-    are frozen into buffers, leaving every module output mathematically
-    unchanged while reshaping activation/weight distributions to be more
-    quantization-friendly.
+    the layer, using cached calibration data. After training, weight transforms
+    are absorbed on CPU in FP64. Input transforms, including the diagonal, are
+    exported through compressed-tensors TransformConfig. Source norms are not
+    patched or modified, so shared consumers and temporary offset-norm restore
+    are safe. Exact floating-point equivalence only applies with quantization
+    and clipping disabled; learned clipping is intentionally lossy.
 
     Like AWQModifier, this is a transform-based modifier: it does not
     quantize anything by itself and must be applied before a modifier which
     inherits from QuantizationMixin, which will then observe the transformed
     weights. During training, fake-quantizers matching the intended
     downstream scheme (``w_bits``/``a_bits``/symmetry/lwc/lac) are used to
-    shape the transforms; they are disabled once training completes, so the
-    eval-mode forward is mathematically equivalent to the original.
+    shape the transforms. The training patches are removed after optimization;
+    native input hooks transform and clip activations before the downstream
+    quantized forward. Use load_flatquant_model for explicit checkpoint reload
+    on Transformers versions which do not reconstruct transform_config.
 
     Example recipe:
     ```yaml
@@ -146,7 +157,7 @@ class FlatQuantModifier(Modifier):
         - set unresolved mappings if not set by user, based on architecture
     - on_calibration_start
         - resolve mappings against the model, constructing transforms
-        - patch the forward of all involved norms/linears (org mode)
+        - patch the forward of involved linears (org mode)
         - freeze model parameters inside the training units
         - attach forward-arg cache hooks on each unit parent and input-max
             statistics hooks on each target linear
@@ -160,19 +171,19 @@ class FlatQuantModifier(Modifier):
         - raise if any cached data was left unconsumed
         - remove hooks (falling back any never-executed units to original)
     - on_finalize
-        - clear all runtime state
+        - clear training state; native serializable input transforms remain
 
     Deviations from the msmodelslim blueprint, all noted for maintainers:
 
-    - modules are forward-patched in place rather than replaced, so the
-        quantization config applied by QuantizationMixin is unaffected
+    - training patches are replaced with native input transform hooks for eval
+    - diagonals remain online, rather than modifying shared source parameters
+    - quantization scales/ranges use compressed-tensors numerics; learnable
+        activation clipping is an explicit clamp before native dynamic QDQ
     - the fp teacher outputs are computed in the model's native dtype rather
         than casting each layer to fp32
     - the learnable diagonal is initialized from the elementwise max of the
         input-max statistics over all targets of the pair (the blueprint leaks
         a loop variable and uses the last target's statistics)
-    - the diagonal absorption also scales the source bias (if any), which is
-        required for exactness but omitted in the blueprint
     - distributed execution is not supported (parameters would diverge across
         ranks without gradient synchronization)
 
@@ -189,8 +200,7 @@ class FlatQuantModifier(Modifier):
     :param add_diag: include a learnable diagonal in the transforms of
         norm_linear and mlp_linear_linear pairs (the v_proj -> o_proj pair
         never has one)
-    :param diag_relu: keep the learnable diagonal and SVD singular values
-        positive via softplus
+    :param diag_relu: keep SVD singular values positive via softplus
     :param tran_type: parameterization of the Kronecker factors, "svd"
         (orthogonal via Cayley) or "inv" (directly learnable invertible)
     :param warmup: prepend a short linear lr warmup to the cosine schedule
@@ -218,9 +228,9 @@ class FlatQuantModifier(Modifier):
     model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
 
     mappings: list[FlatQuantMapping] | None = None
-    epochs: int = 15
-    lr: float = 5e-3
-    diag_alpha: float = 0.3
+    epochs: int = Field(default=15, ge=1)
+    lr: float = Field(default=5e-3, gt=0, allow_inf_nan=False)
+    diag_alpha: float = Field(default=0.3, ge=0, le=1)
     add_diag: bool = True
     diag_relu: bool = True
     tran_type: str = "svd"
@@ -247,6 +257,13 @@ class FlatQuantModifier(Modifier):
     )
     # per-target running max of |input|, used to initialize the diagonals
     _act_stats: dict[str, torch.Tensor] = PrivateAttr(default_factory=dict)
+
+    @field_validator("w_bits", "a_bits")
+    @classmethod
+    def validate_bits(cls, value: int) -> int:
+        if value not in (*range(2, 9), 16):
+            raise ValueError("FlatQuant bit widths must be 2..8 or 16")
+        return value
 
     @field_validator("amp_dtype")
     @classmethod
@@ -307,6 +324,16 @@ class FlatQuantModifier(Modifier):
                 "rank without gradient synchronization"
             )
 
+        recipe = active_session().lifecycle.recipe
+        if any(
+            isinstance(modifier, QuantizationMixin)
+            for modifier in getattr(recipe, "modifiers", [])
+        ):
+            raise ValueError(
+                "FlatQuant requires pipeline='independent' so downstream observers "
+                "and GPTQ Hessians see the trained input transforms"
+            )
+
         torch.manual_seed(self.seed)
 
         self._resolve_mappings(state.model)
@@ -321,10 +348,17 @@ class FlatQuantModifier(Modifier):
         executed during this sequential pass. Units of other subgraphs are
         identified by their (still empty) args cache and skipped.
         """
-        for unit in self._training_units:
-            cache = self._parent_args_cache.get(unit.parent)
-            if cache is not None and len(cache) > 0:
-                self._train_unit(state.model, unit)
+        try:
+            for unit in self._training_units:
+                cache = self._parent_args_cache.get(unit.parent)
+                if cache is not None and len(cache) > 0:
+                    self._train_unit(state.model, unit)
+        except Exception:
+            self.remove_hooks()
+            for unit in self._training_units:
+                if unit.parent in self._parent_args_cache:
+                    self._unpatch_unit(unit)
+            raise
 
     def on_calibration_end(self, state: State, event: Event, **kwargs):
         """
@@ -332,17 +366,18 @@ class FlatQuantModifier(Modifier):
         any never-executed unit back to its original forward, and removing
         hooks.
         """
-        for cache in self._parent_args_cache.values():
-            if len(cache) > 0:
-                raise RuntimeError("Some cached activations were not used")
-
-        for unit in self._training_units:
-            if unit.parent in self._parent_args_cache:
-                # parent never executed (e.g. calibration data did not reach
-                # it): fall back to the original forward
-                self._unpatch_unit(unit)
-
-        self.remove_hooks()
+        try:
+            for cache in self._parent_args_cache.values():
+                if len(cache) > 0:
+                    raise RuntimeError("Some cached activations were not used")
+            for unit in self._training_units:
+                if unit.parent in self._parent_args_cache:
+                    self._unpatch_unit(unit)
+        finally:
+            for unit in self._training_units:
+                if unit.parent in self._parent_args_cache:
+                    self._unpatch_unit(unit)
+            self.remove_hooks()
 
     def on_finalize(self, state: State, **kwargs) -> bool:
         """
@@ -353,6 +388,7 @@ class FlatQuantModifier(Modifier):
         :param state: unused
         :return: True
         """
+        self.remove_hooks()
         self._parent_args_cache.clear()
         self._act_stats.clear()
         self._training_units.clear()
@@ -399,8 +435,7 @@ class FlatQuantModifier(Modifier):
                     continue
 
                 if not any(
-                    hasattr(module, "quantization_scheme")
-                    for module in (source, *targets)
+                    hasattr(module, "quantization_scheme") for module in targets
                 ):
                     logger.warning(
                         f"Skipping {source_name} for mapping {mapping} because no "
@@ -413,6 +448,17 @@ class FlatQuantModifier(Modifier):
                 if trans is None:
                     num_skipped += 1
                     continue
+
+                if mapping.pair_kind == NORM_LINEAR:
+                    # The source remains unchanged, so ignored consumers need
+                    # no compensation and must not receive fake quantization.
+                    selected = [
+                        (name, target)
+                        for name, target in zip(target_names, targets)
+                        if hasattr(target, "quantization_scheme")
+                    ]
+                    target_names = [name for name, _ in selected]
+                    targets = [target for _, target in selected]
 
                 ancestor_name, ancestor = get_lowest_common_ancestor_with_avoid(
                     [source_name, *target_names], model, torch.nn.ModuleList
@@ -443,6 +489,21 @@ class FlatQuantModifier(Modifier):
                 f"the mappings argument: {self.mappings}"
             )
 
+        input_targets = set()
+        output_sources = set()
+        for mapping in resolved:
+            for target in mapping.target_modules:
+                if target in input_targets:
+                    raise ValueError(
+                        "Multiple FlatQuant input transforms target the same Linear"
+                    )
+                input_targets.add(target)
+            if mapping.pair_kind == ATTN_LINEAR_LINEAR:
+                if mapping.source_module in output_sources:
+                    raise ValueError(
+                        "Multiple FlatQuant output transforms target the same Linear"
+                    )
+                output_sources.add(mapping.source_module)
         self._resolved_mappings = resolved
 
     def _build_trans(
@@ -468,6 +529,10 @@ class FlatQuantModifier(Modifier):
                     "does not have a 1D weight"
                 )
                 return None
+            if any(target.in_features != source.weight.numel() for target in targets):
+                raise ValueError(
+                    f"FlatQuant norm mapping has mismatched input dimensions: {mapping}"
+                )
             dims = get_decompose_dim(source.weight.shape[0])
             if dims is None:
                 logger.debug(
@@ -490,15 +555,22 @@ class FlatQuantModifier(Modifier):
                     f"{type(source)} is not a Linear"
                 )
                 return None
-            head_dim = self._head_dim(model, source, targets[0])
-            if head_dim is None:
+            if any(target.in_features != targets[0].in_features for target in targets):
+                raise ValueError("Attention targets must have the same input dimension")
+            # MSMODELSLIM-COMPAT: a^2 - b^2 decomposition, matching
+            # vllm-ascend's native solve_kronecker_decompose so the exported
+            # left_trans / right_trans shapes match the parameters the native
+            # scheme pre-allocates.  The head_dim split differs for models
+            # where it is not the minimal a^2 - b^2 solution (e.g. 4096).
+            dims = get_decompose_dim(targets[0].in_features)
+            if dims is None:
+                logger.debug(
+                    f"Skipping FlatQuant mapping {mapping}: attention input "
+                    f"{targets[0].in_features} admits no Kronecker decomposition"
+                )
                 return None
-            # the left factor acts across the heads of the target input, which
-            # correctly handles GQA (where v_proj has fewer heads than o_proj)
-            left_size = targets[0].in_features // head_dim
             return GeneralMatrixTrans(
-                left_size,
-                head_dim,
+                *dims,
                 add_diag=False,
                 diag_relu=self.diag_relu,
                 tran_type=self.tran_type,
@@ -511,6 +583,10 @@ class FlatQuantModifier(Modifier):
                 "is not a Linear"
             )
             return None
+        if any(target.in_features != source.out_features for target in targets):
+            raise ValueError(
+                f"FlatQuant MLP mapping has mismatched dimensions: {mapping}"
+            )
         dims = get_decompose_dim(source.weight.shape[0])
         if dims is None:
             logger.debug(
@@ -533,6 +609,14 @@ class FlatQuantModifier(Modifier):
         present, else hidden_size // num_attention_heads.
         """
         config = getattr(model, "config", None)
+        config = getattr(config, "text_config", config)
+        if getattr(config, "attn_output_gate", False) or getattr(
+            config, "output_gate", False
+        ):
+            raise ValueError(
+                "FlatQuant v_proj -> o_proj cannot cross attention output gating. "
+                "Omit this pair for Qwen3.5/Qwen3.6 gated attention."
+            )
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             hidden_size = getattr(config, "hidden_size", None)
@@ -556,31 +640,46 @@ class FlatQuantModifier(Modifier):
         return head_dim
 
     def _validate_downstream_schemes(self) -> None:
-        """
-        The fake activation quantizers used while training are per-token
-        dynamic, and the online transforms reshape activations after
-        calibration, so static (or locally-static) input activation schemes
-        downstream would observe the wrong distributions. Warn in that case.
-        """
-        static_targets = []
+        """Reject unsupported numerics before patching or modifying parameters."""
+        checked = set()
         for mapping in self._resolved_mappings:
-            for name, target in zip(mapping.target_names, mapping.target_modules):
-                scheme = getattr(target, "quantization_scheme", None)
-                activations = getattr(scheme, "input_activations", None)
-                if activations is not None and activations.dynamic in (
-                    False,
-                    DynamicType.LOCAL,
+            for module in (mapping.source_module, *mapping.target_modules):
+                if module in checked or not isinstance(module, torch.nn.Linear):
+                    continue
+                checked.add(module)
+                scheme = getattr(module, "quantization_scheme", None)
+                if scheme is None:
+                    continue
+                weights = scheme.weights
+                activations = scheme.input_activations
+                if weights is not None and (
+                    weights.type != "int"
+                    or weights.strategy != "channel"
+                    or weights.dynamic is not False
+                    or weights.num_bits != self.w_bits
+                    or weights.symmetric != self.w_sym
+                    or weights.scale_dtype is not None
                 ):
-                    static_targets.append(name)
-
-        if static_targets:
-            logger.warning(
-                f"Found static input activation quantization schemes on "
-                f"{len(static_targets)} FlatQuant targets (e.g. {static_targets[:3]}). "
-                "FlatQuant assumes dynamic (per-token) activation quantization "
-                "downstream; static activation scales observed after the "
-                "transform may be inaccurate."
-            )
+                    raise ValueError(
+                        "FlatQuant training requires matching per-channel static INT "
+                        f"weights (w_bits={self.w_bits}, w_sym={self.w_sym})"
+                    )
+                if activations is not None and (
+                    activations.type != "int"
+                    or activations.strategy != "token"
+                    or activations.dynamic is not True
+                    or activations.num_bits != self.a_bits
+                    or activations.symmetric != self.a_sym
+                    or activations.scale_dtype is not None
+                ):
+                    raise ValueError(
+                        "FlatQuant training requires matching dynamic per-token INT "
+                        f"activations (a_bits={self.a_bits}, a_sym={self.a_sym})"
+                    )
+                if scheme.output_activations is not None:
+                    raise ValueError(
+                        "FlatQuant output activation quantization is unsupported"
+                    )
 
     def _build_training_units(self) -> None:
         """
@@ -630,7 +729,7 @@ class FlatQuantModifier(Modifier):
 
     def _patch_units(self) -> None:
         """
-        Patch the forward of every source norm and target linear, register
+        Patch target linears and supported attention sources, register
         per-target fake quantizers (sharing one lac clip factor per pair) and
         the transform homes, then freeze all parameters inside the units
         (trainable parameters are re-enabled at training time).
@@ -639,9 +738,15 @@ class FlatQuantModifier(Modifier):
             for mapping in unit.mappings:
                 trans = mapping.trans
                 if mapping.pair_kind == NORM_LINEAR:
-                    patch_flatquant_norm(mapping.source_module, trans)
-                    for target in mapping.target_modules:
-                        self._patch_linear(target, weight_in_trans=trans)
+                    # Transform each consumer, not the norm output. Other
+                    # consumers (routers, residuals, gated attention branches)
+                    # stay unchanged, including after temporary norm restore.
+                    for index, target in enumerate(mapping.target_modules):
+                        self._patch_linear(
+                            target, act_in_trans=trans, weight_in_trans=trans
+                        )
+                        if index == 0:
+                            register_flatquant_trans(target, trans)
                 elif mapping.pair_kind == ATTN_LINEAR_LINEAR:
                     # the right factor is applied to the v_proj output (and
                     # absorbed into its weight), the left factor stays online
@@ -670,7 +775,8 @@ class FlatQuantModifier(Modifier):
                     clip_factor = Parameter(torch.ones(1) * 1.0, requires_grad=True)
                     for target in mapping.target_modules:
                         state = getattr(target, FLATQUANT_STATE_ATTR)
-                        state.act_quantizer.clip_factor = clip_factor
+                        if state.act_quantizer.lac:
+                            state.act_quantizer.clip_factor = clip_factor
 
             # freeze all parameters inside the unit; the transforms are
             # re-enabled by name at training time
@@ -687,17 +793,22 @@ class FlatQuantModifier(Modifier):
         """
         state = getattr(module, FLATQUANT_STATE_ATTR, None)
         if state is None:
+            scheme = getattr(module, "quantization_scheme", None)
+            weights = getattr(scheme, "weights", None)
+            activations = getattr(scheme, "input_activations", None)
             state = patch_flatquant_linear(
                 module,
                 act_quantizer=ActivationQuantizer(
-                    self.a_bits, sym=self.a_sym, lac=self.lac
+                    self.a_bits if activations is not None else 16,
+                    sym=self.a_sym,
+                    lac=self.lac and activations is not None,
                 ),
                 weight_quantizer=WeightQuantizer(
                     in_size=module.weight.shape[1],
                     out_size=module.weight.shape[0],
-                    bits=self.w_bits,
+                    bits=self.w_bits if weights is not None else 16,
                     sym=self.w_sym,
-                    lwc=self.lwc,
+                    lwc=self.lwc and weights is not None,
                 ),
                 **transforms,
             )
@@ -791,16 +902,16 @@ class FlatQuantModifier(Modifier):
         3. train the transforms jointly: one optimizer over all transform and
             clip-factor parameters of the unit, one step per calibration
             sample, MSE loss normalized by its (detached) value
-        4. absorb the transforms (fp64 weight absorption, fp32 diagonal
-            absorption into the source weight), freeze them into buffers,
-            disable the fake quantizers, and switch to eval mode
+        4. absorb weights on CPU in FP64, retain the diagonal online, then
+            replace training patches with native serializable input hooks
         """
         parent = unit.parent
         cache = self._parent_args_cache[parent]
 
         # pin memory for faster onloading during replay
-        for batch_index in range(len(cache)):
-            cache.pin_memory(batch_index)
+        if get_execution_device(parent).type != "cpu":
+            for batch_index in range(len(cache)):
+                cache.pin_memory(batch_index)
 
         involved = [parent]
         for mapping in unit.mappings:
@@ -839,12 +950,29 @@ class FlatQuantModifier(Modifier):
 
             # 3. training
             set_flatquant_mode(unit.modules, MODE_CALIB)
-            self._train_loop(unit, fp_outs)
+            try:
+                self._train_loop(unit, fp_outs)
+            except Exception:
+                self.remove_hooks()
+                self._unpatch_unit(unit)
+                raise
+
+            # DIAG-CHECK: print diagonal stats after training, before absorption
+            for mapping in unit.mappings:
+                trans = mapping.trans
+                if trans.diag_trans is not None and trans.diag_trans.diag_scale is not None:
+                    d = trans.diag_trans.diag_scale.data
+                    logger.info(
+                        f"DIAG-CHECK {unit.parent_name}: "
+                        f"min={d.min():.6f} max={d.max():.6f} "
+                        f"mean={d.mean():.6f} extreme={(d.abs() > 20).sum().item()}"
+                    )
 
             # 4. absorption
             with torch.no_grad():
                 self._absorb_unit(unit)
             set_flatquant_mode(unit.modules, MODE_EVAL)
+            self._export_unit(model, unit)
 
         # remove caches and stats belonging to this unit
         del self._parent_args_cache[parent]
@@ -858,14 +986,13 @@ class FlatQuantModifier(Modifier):
         batch, returning the first output of each pass.
         """
         cache = self._parent_args_cache[module]
-        use_prefetch = active_session().state.sequential_prefetch
-        batch_iter = cache.iter_prefetch() if use_prefetch else cache
-        outputs = [module(**batch) for batch in batch_iter]
-        return [
-            # if tuple, the first output is the hidden state
-            output[0] if isinstance(output, tuple) else output
-            for output in outputs
-        ]
+        batch_iter = cache.iter_prefetch()
+        outputs = []
+        for batch in batch_iter:
+            output = module(**batch)
+            output = output[0] if isinstance(output, tuple) else output
+            outputs.append(output.detach().cpu())
+        return outputs
 
     def _init_diag_scales(self, unit: TrainingUnit) -> None:
         """
@@ -933,17 +1060,16 @@ class FlatQuantModifier(Modifier):
         loss_fn = torch.nn.MSELoss()
         device = get_execution_device(unit.parent)
         cache = self._parent_args_cache[unit.parent]
-        use_prefetch = active_session().state.sequential_prefetch
         amp_dtype = torch.bfloat16 if self.amp_dtype == "bfloat16" else torch.float16
 
         pbar = tqdm(
             total=self.epochs * num_samples, desc=f"FlatQuant {unit.parent_name}"
         )
         # the sequential pipeline invokes this hook inside a no_grad context
-        with torch.enable_grad():
+        with torch.enable_grad(), pbar:
             for _epoch in range(self.epochs):
                 epoch_mse = 0.0
-                batch_iter = cache.iter_prefetch() if use_prefetch else cache
+                batch_iter = cache.iter_prefetch()
                 for sample_idx, batch in enumerate(batch_iter):
                     with torch.amp.autocast(
                         device_type=device.type,
@@ -955,13 +1081,32 @@ class FlatQuantModifier(Modifier):
                             output[0] if isinstance(output, tuple) else output
                         )
                         loss = loss_fn(
-                            quant_output, fp_outs[sample_idx].to(quant_output.device)
+                            quant_output.float(),
+                            fp_outs[sample_idx].to(quant_output.device).float(),
                         )
 
+                    if not torch.isfinite(loss):
+                        raise RuntimeError(
+                            f"Non-finite FlatQuant loss in {unit.parent_name}"
+                        )
                     epoch_mse += loss.detach().float().item()
-                    loss = loss / loss.clone().detach()
+                    if loss.detach().item() == 0:
+                        pbar.update(1)
+                        continue
+                    loss = loss / loss.detach().clamp_min(torch.finfo(loss.dtype).tiny)
                     optimizer.zero_grad()
                     loss.backward()
+                    if any(
+                        param.grad is not None and not torch.isfinite(param.grad).all()
+                        for group in param_groups
+                        for param in group["params"]
+                    ):
+                        raise RuntimeError(
+                            f"Non-finite FlatQuant gradients in {unit.parent_name}"
+                        )
+                    # V6: gradient clipping removed — fp32 params (23-bit
+                    # mantissa) allow diagonal to freely adjust from any
+                    # value, so early-step spikes self-correct.
                     optimizer.step()
                     scheduler.step()
                     pbar.update(1)
@@ -971,11 +1116,8 @@ class FlatQuantModifier(Modifier):
                     f"FlatQuant unit {unit.parent_name} epoch {_epoch}: "
                     f"MSE loss {epoch_mse:.6e}, lr {scheduler.get_last_lr()[0]:.8f}"
                 )
-        pbar.close()
 
-    def _get_trainable_parameters(
-        self, parent: Module, base_lr: float
-    ) -> list[dict]:
+    def _get_trainable_parameters(self, parent: Module, base_lr: float) -> list[dict]:
         """
         Collect the transform and clip-factor parameters within a unit,
         grouped by name for the optimizer (clip factors train at 10x lr),
@@ -987,7 +1129,21 @@ class FlatQuantModifier(Modifier):
         """
         params: dict[str, list[Parameter]] = {key: [] for key in TRAINABLE_KEYS}
         seen: set[int] = set()
+        owned = set()
+        for module in get_patched_modules(parent):
+            state = getattr(module, FLATQUANT_STATE_ATTR)
+            for part in (
+                state.act_in_trans,
+                state.weight_in_trans,
+                state.weight_out_trans,
+                state.act_quantizer,
+                state.weight_quantizer,
+            ):
+                if part is not None:
+                    owned.update(id(parameter) for parameter in part.parameters())
         for name, param in parent.named_parameters():
+            if id(param) not in owned:
+                continue
             for key in TRAINABLE_KEYS:
                 if key in name:
                     param.requires_grad = True
@@ -996,6 +1152,9 @@ class FlatQuantModifier(Modifier):
                         params[key].append(param)
                     break
 
+        # Diagonal trains at the same lr as Kronecker factors. The clamp in
+        # DiagonalTransMatrix.forward (max=10.0) and gradient clipping
+        # (max_norm=1.0) prevent runaway values without slowing convergence.
         param_groups = [
             {"params": params[key], "lr": base_lr}
             for key in BASE_LR_KEYS
@@ -1011,63 +1170,31 @@ class FlatQuantModifier(Modifier):
     ##############
 
     def _absorb_unit(self, unit: TrainingUnit) -> None:
-        """
-        Absorb the trained transforms of a unit into the model weights, in
-        the order used by the blueprint:
+        """Freeze transforms and absorb target weights on CPU in FP64.
 
-        1. per target linear: apply the weight input transform (inverse
-            transpose, in fp64), the learned weight clipping, and the weight
-            output transform (including the bias) to the weight, then
-            reparameterize the fake quantizers and drop the transform
-            references
-        2. per pair: absorb the learnable diagonal (in fp32) into the source
-            module's weight (and bias, if any)
-        3. freeze the Kronecker factors into buffers
-        4. disable the fake quantizers, so eval mode is mathematically
-            equivalent to the original module and the actual quantization is
-            left to the subsequent quantization modifier
+        The diagonal stays in the input transform. Source norms and MLP
+        projections are untouched; no offset-gamma restore/writeback is needed.
+        Learned weight clipping is intentionally lossy when enabled.
         """
-        # 1. weight absorption, per patched linear
+        # MSMODELSLIM-COMPAT: absorb the learnable diagonal into the source
+        # module so the exported checkpoint carries only left/right/clip_ratio.
+        self._absorb_diagonal(unit)
+
+        for mapping in unit.mappings:
+            mapping.trans.to_eval_mode()
+            mapping.trans.to(device="cpu", dtype=torch.float64)
+
         for module in unit.modules:
             if isinstance(module, torch.nn.Linear):
                 self._absorb_linear(module)
 
-        # 2. diagonal absorption into the source module
+        # MSMODELSLIM-COMPAT: defer diagonal removal — the target weights have
+        # now absorbed the full (D R L) transform, so D must not be applied
+        # online nor exported.
         for mapping in unit.mappings:
-            trans = mapping.trans
-            if trans is None:
-                continue
+            if getattr(mapping.trans, "diag_trans", None) is not None:
+                mapping.trans.diag_trans = None
 
-            if trans.diag_trans is not None:
-                source = mapping.source_module
-                diag = trans.diag_trans.diag_scale.data.to(torch.float32)
-
-                weight = source.weight.data.to(torch.float32)
-                if weight.dim() == 1:
-                    weight = weight * diag
-                elif weight.dim() == 2:
-                    weight = weight * diag.unsqueeze(1)
-                else:
-                    raise ValueError(f"Unsupported source weight dim: {weight.dim()}")
-                update_offload_parameter(
-                    source, "weight", weight.to(source.weight.dtype)
-                )
-
-                bias = getattr(source, "bias", None)
-                if bias is not None:
-                    update_offload_parameter(
-                        source,
-                        "bias",
-                        (bias.data.to(torch.float32) * diag).to(bias.dtype),
-                    )
-
-            # 3. freeze the kron factors (and null the diagonal) into
-            #    buffers, for every pair: v_proj -> o_proj pairs carry no
-            #    diagonal but their factors must still be frozen
-            trans.to_eval_mode()
-
-        # 4. disable fake quantizers: eval forward = online transform +
-        #    absorbed weights == original math
         for module in unit.modules:
             state = getattr(module, FLATQUANT_STATE_ATTR)
             if state.act_quantizer is not None:
@@ -1075,6 +1202,57 @@ class FlatQuantModifier(Modifier):
             if state.weight_quantizer is not None:
                 state.weight_quantizer.enable = False
                 state.weight_quantizer.enable_find = False
+
+    def _absorb_diagonal(self, unit: TrainingUnit) -> None:
+        """MSMODELSLIM-COMPAT: fold diag_scale into the source module.
+
+        llm-compressor keeps the diagonal online at the target input.  The
+        native vllm-ascend FlatQuant scheme has no diagonal parameter, so the
+        scaling must be pushed upstream:
+
+          norm  : (x_norm * g) * d == x_norm * (g * d)   -> norm.weight *= d
+          linear: (x @ W^T) * d   == x @ (W * d)^T      -> weight *= d[:, None]
+
+        The diagonal is then detached from the transform so it is neither
+        applied online nor written to the checkpoint.
+        """
+        for mapping in unit.mappings:
+            trans = mapping.trans
+            diag = getattr(trans, "diag_trans", None)
+            if diag is None or diag.diag_scale is None:
+                continue
+            d = diag.diag_scale.detach().to(torch.float64)
+            source = mapping.source_module
+            weight = source.weight.detach()
+            original_device = weight.device
+            original_dtype = weight.dtype
+            w = weight.to(device="cpu", dtype=torch.float64)
+            if w.dim() == 1:
+                if w.numel() != d.numel():
+                    raise RuntimeError(
+                        f"diagonal size {d.numel()} != norm weight {w.numel()} "
+                        f"for {mapping}"
+                    )
+                w = w * d
+            elif w.dim() == 2:
+                if w.shape[0] != d.numel():
+                    raise RuntimeError(
+                        f"diagonal size {d.numel()} != linear out_features "
+                        f"{w.shape[0]} for {mapping}"
+                    )
+                w = w * d.unsqueeze(1)
+            else:
+                raise RuntimeError(f"unsupported source weight dim {w.dim()}")
+            if not torch.isfinite(w).all():
+                raise RuntimeError("non-finite source weight after diagonal absorb")
+            update_offload_parameter(
+                source,
+                "weight",
+                w.to(dtype=original_dtype).to(original_device),
+            )
+            # MSMODELSLIM-COMPAT: defer diagonal removal until AFTER the
+            # target weights absorb the full (D R L) transform.  Dropping it
+            # here would lose the D^{-T} factor and corrupt the weights.
 
     def _absorb_linear(self, module: Module) -> None:
         """
@@ -1088,9 +1266,10 @@ class FlatQuantModifier(Modifier):
         weight_out_trans = state.weight_out_trans
 
         if weight_in_trans is not None or weight_out_trans is not None:
-            weight = module.weight.data
+            weight = module.weight.detach()
             ori_dtype = weight.dtype
-            weight = weight.to(torch.float64)
+            original_device = weight.device
+            weight = weight.to(device="cpu", dtype=torch.float64)
 
             if weight_in_trans is not None:
                 weight = weight_in_trans(weight, inv_t=True)
@@ -1101,15 +1280,98 @@ class FlatQuantModifier(Modifier):
                 if module.bias is not None:
                     # the blueprint absorbs the bias in its original dtype
                     update_offload_parameter(
-                        module, "bias", weight_out_trans(module.bias.data)
+                        module,
+                        "bias",
+                        weight_out_trans(
+                            module.bias.detach().to(device="cpu", dtype=torch.float64)
+                        ).to(device=module.bias.device, dtype=module.bias.dtype),
                     )
 
-            update_offload_parameter(module, "weight", weight.to(ori_dtype))
+            if not torch.isfinite(weight).all():
+                raise RuntimeError("Non-finite FlatQuant weights after absorption")
+            converted = weight.to(dtype=ori_dtype)
+            if not torch.isfinite(converted).all():
+                raise RuntimeError("FlatQuant weights overflowed the model dtype")
+            update_offload_parameter(module, "weight", converted.to(original_device))
             state.weight_in_trans = None
             state.weight_out_trans = None
 
         state.act_quantizer.reparameterize()
         state.weight_quantizer.reparameterize()
+
+    def _export_unit(self, model: Module, unit: TrainingUnit) -> None:
+        """Replace training patches with native, serializable input hooks.
+
+        Only INPUT applications are exported: the checkpoint already contains
+        transformed weights, so reloading must never reapply weight absorption.
+        """
+        previous = getattr(model, TRANSFORM_CONFIG_NAME, None)
+        names = set(previous.config_groups) if previous is not None else set()
+        groups = {}
+        payloads = []
+        module_names = get_module_to_name_dict(model)
+        for module in unit.modules:
+            state = getattr(module, FLATQUANT_STATE_ATTR)
+            trans = state.act_in_trans
+            quantizer = state.act_quantizer
+            clipped = quantizer is not None and quantizer.lac and quantizer.bits < 16
+            if trans is None and not clipped:
+                continue
+            key = find_unique_name("flatquant", names)
+            names.add(key)
+            if trans is None:
+                left, right = get_decompose_dim(module.in_features) or (
+                    1,
+                    module.in_features,
+                )
+                left_matrix, right_matrix = torch.eye(left), torch.eye(right)
+                diagonal = torch.ones(module.in_features)
+            elif isinstance(trans, GeneralMatrixTrans):
+                left_matrix = trans.left_trans.get_matrix().detach()
+                right_matrix = trans.right_trans.get_matrix().detach()
+                diagonal = (
+                    trans.diag_trans.diag_scale.detach()
+                    if trans.diag_trans is not None
+                    else torch.ones(module.in_features)
+                )
+            else:
+                # The across-head factor of a supported v_proj -> o_proj pair.
+                left_matrix = trans.get_matrix().detach()
+                right_matrix = torch.eye(module.in_features // trans.size)
+                diagonal = torch.ones(module.in_features)
+            ratio = quantizer.get_clip_ratio().detach() if clipped else torch.ones(1)
+            groups[key] = TransformScheme(
+                type="flatquant" if quantizer.sym else "flatquant-asymmetric",
+                head_dim=right_matrix.shape[0],
+                precision=torch.float32,
+                apply=[TransformArgs(targets=[module_names[module]], location="input")],
+            )
+            payloads.append(
+                (
+                    module,
+                    f"{key}_input",
+                    {
+                        "left": left_matrix,
+                        "right": right_matrix,
+                        "clip_ratio": ratio,
+                    },
+                )
+            )
+
+        for module in unit.modules:
+            unpatch_flatquant_module(module)
+        config = TransformConfig(config_groups=groups)
+        apply_transform_config(model, config)
+        for module, name, parameters in payloads:
+            runtime = getattr(module, name)
+            assert isinstance(runtime, FlatQuantInputTransform)
+            for parameter, value in parameters.items():
+                update_offload_parameter(
+                    runtime, parameter, value.to(dtype=torch.float32)
+                )
+        if previous is not None:
+            previous.merge(config)
+            setattr(model, TRANSFORM_CONFIG_NAME, previous)
 
     def _unpatch_unit(self, unit: TrainingUnit) -> None:
         """

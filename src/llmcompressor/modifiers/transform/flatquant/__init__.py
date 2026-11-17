@@ -10,6 +10,7 @@ from .mappings import (
     default_mappings,
     get_layer_mappings_from_model,
 )
+from .runtime import load_flatquant_model
 
 __all__ = [
     "ATTN_LINEAR_LINEAR",
@@ -22,4 +23,5 @@ __all__ = [
     "ResolvedFlatQuantMapping",
     "default_mappings",
     "get_layer_mappings_from_model",
+    "load_flatquant_model",
 ]

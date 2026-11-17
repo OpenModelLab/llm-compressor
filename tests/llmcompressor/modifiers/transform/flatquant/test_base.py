@@ -253,7 +253,7 @@ def test_resolve_mappings():
         "decoder.self_attn.v_proj",
     }
     # unlike AWQ, the source is included in the LCA so that the replay of the
-    # training unit covers the norm's online transform as well
+    # training unit covers the target inputs fed by the norm
     assert norm_pair.parent_name == "decoder"
     assert (
         norm_pair.trans.left_trans.size * norm_pair.trans.right_trans.size == HIDDEN
@@ -344,13 +344,14 @@ def test_training_units_merge_nested_ancestors():
     modifier = FlatQuantModifier(mappings=_toy_mappings())
     modifier._resolve_mappings(model)
     modifier._build_training_units()
+    modifier._patch_units()
 
     assert len(modifier._training_units) == 1
     unit = modifier._training_units[0]
     assert unit.parent is model["decoder"]
     assert len(unit.mappings) == 4
-    # 2 norms and 7 linears are patched inside the unit
-    assert len(unit.modules) == 9
+    # 7 linears are patched inside the unit (norms are left untouched)
+    assert len(unit.modules) == 7
 
 
 @pytest.mark.unit
@@ -360,8 +361,8 @@ def test_calib_and_eval_forwards_match_original(tran_type):
     The central invariant of FlatQuant: with fake quantization disabled, both
     the online (calib) transform and the absorbed (eval) weights must
     reproduce the original outputs exactly, for every structure pair at once
-    (norm pairs including the learnable diagonal and bias absorption, the GQA
-    v->o pair, and the up->down pair).
+    (norm pairs with the diagonal folded into the source weight, the GQA
+    v->o pair with bias absorption, and the up->down pair).
     """
     torch.manual_seed(0)
     model = _build_toy_model()
@@ -375,7 +376,7 @@ def test_calib_and_eval_forwards_match_original(tran_type):
     unit = modifier._training_units[0]
     decoder = model["decoder"]
     patched = get_patched_modules(decoder)
-    assert len(patched) == 9
+    assert len(patched) == 7
 
     # move the diagonals away from their ones initialization so the diagonal
     # absorption paths are actually exercised

@@ -18,14 +18,15 @@ import types
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-import torch
 import torch.nn.functional as F
+from compressed_tensors.offload import unwrap_offload_forward
 from torch.nn import Module
 
 from llmcompressor.modifiers.transform.flatquant.components import (
     ActivationQuantizer,
     GeneralMatrixTrans,
     WeightQuantizer,
+    clip_activation,
 )
 
 __all__ = [
@@ -136,17 +137,14 @@ def _eval_linear_forward(module: Module, state: FlatQuantState, hidden_states):
     if state.act_in_trans is not None:
         hidden_states = state.act_in_trans(hidden_states)
 
-    weight = module.weight
-    bias = module.bias
-
-    if state.act_quantizer is not None and state.act_quantizer.enable:
-        hidden_states = state.act_quantizer(hidden_states)
-    if state.weight_quantizer is not None and state.weight_quantizer.enable:
-        # enable_find is disabled after training, so this quantizes with
-        # the frozen scales rather than recomputing them each forward
-        weight = state.weight_quantizer(weight)
-
-    return F.linear(hidden_states, weight, bias)
+    quantizer = state.act_quantizer
+    if quantizer is not None and quantizer.lac and quantizer.bits < 16:
+        hidden_states = clip_activation(
+            hidden_states, quantizer.get_clip_ratio().to(hidden_states), quantizer.sym
+        )
+    # Keep native quantization_enabled/status handling, weight QDQ, and
+    # activation/output quantization. Never bypass this with F.linear.
+    return state.orig_forward(hidden_states)
 
 
 def _flat_norm_forward(module: Module, hidden_states):
@@ -184,7 +182,6 @@ def patch_flatquant_linear(
         raise ValueError(f"Module {module} is already patched with flatquant")
 
     state = FlatQuantState(mode=MODE_ORG)
-    state.orig_forward = module.forward
     state.act_in_trans = act_in_trans
     state.weight_in_trans = weight_in_trans
     state.weight_out_trans = weight_out_trans
@@ -196,7 +193,11 @@ def patch_flatquant_linear(
         module.add_module(FLATQUANT_ACT_QUANTIZER_NAME, act_quantizer)
     if weight_quantizer is not None:
         module.add_module(FLATQUANT_WEIGHT_QUANTIZER_NAME, weight_quantizer)
-    module.forward = types.MethodType(_flat_linear_forward, module)
+    # Patch the callable inside native offload, otherwise staging restores
+    # _original_forward_func and silently discards the training patch.
+    with unwrap_offload_forward(module):
+        state.orig_forward = module.forward
+        module.forward = types.MethodType(_flat_linear_forward, module)
 
     return state
 
@@ -217,12 +218,13 @@ def patch_flatquant_norm(module: Module, trans: GeneralMatrixTrans) -> FlatQuant
         raise ValueError(f"Module {module} is already patched with flatquant")
 
     state = FlatQuantState(mode=MODE_ORG)
-    state.orig_forward = module.forward
     state.norm_trans = trans
 
     setattr(module, FLATQUANT_STATE_ATTR, state)
     module.add_module(FLATQUANT_TRANS_NAME, trans)
-    module.forward = types.MethodType(_flat_norm_forward, module)
+    with unwrap_offload_forward(module):
+        state.orig_forward = module.forward
+        module.forward = types.MethodType(_flat_norm_forward, module)
 
     return state
 
@@ -267,12 +269,10 @@ def unpatch_flatquant_module(module: Module):
     if state is None:
         return
 
-    # forward was patched as an instance attribute; deleting it reveals the
-    # original class-level forward
-    try:
-        del module.forward
-    except AttributeError:
-        pass
+    # The original may already be the native quantized/offloaded forward.
+    # Deleting the instance attribute would incorrectly expose nn.Linear.forward.
+    with unwrap_offload_forward(module):
+        module.forward = state.orig_forward
 
     delattr(module, FLATQUANT_STATE_ATTR)
     for name in (
