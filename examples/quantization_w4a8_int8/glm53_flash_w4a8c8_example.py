@@ -1,7 +1,8 @@
-"""GLM-5.3-Flash A3: routed INT4/A8, shared and other linears INT8/A8.
+"""GLM-5.3-Flash INT: routed INT4/A8, shared and other linears INT8/A8.
 
-Uses native model_free_ptq, including MTP checkpoint weights. C8 is a serving
-option: vllm serve ... --kv-cache-dtype int8. No local utility module is needed.
+Uses native model_free_ptq on CPU or Ascend, including MTP checkpoint weights.
+C8 is a serving option, not part of this weight conversion. A2/A3 INT8 cache
+uses --kv-cache-dtype int8; A5 cache support must be verified independently.
 Run the separate checkpoint audit before a full-model conversion.
 """
 
@@ -12,7 +13,14 @@ from pathlib import Path
 IGNORE = [
     r"re:.*norm.*",
     r"re:.*(?:embed_tokens|word_embeddings|position_embeddings|pos_embed).*",
-    r"re:.*(?:conv1d|conv_1d|patch_embed\.proj).*",
+    r"re:.*(?:conv1d|conv_1d|patch_embed\.proj|downsample).*",
+    (
+        r"re:.*(?:A_log|dt_bias|hc_attn_base|hc_attn_scale|"
+        r"hc_ffn_base|hc_ffn_scale|e_score_correction_bias).*"
+    ),
+    # The current Ascend mHC kernel consumes floating parameters. Preserve
+    # both bare checkpoint names and optional Linear-style fn.weight names.
+    r"re:.*(?:\.(?:attn_hc|ffn_hc)\.fn|\.hc_(?:attn|ffn)_fn)$",
 ]
 
 
@@ -44,12 +52,12 @@ def make_config_groups(algorithm="minmax"):
 
 
 class BareProjectionAliases:
-    """Structural Converter protocol: rename bare projections, no quantization math."""
+    """Alias only the supported KPool projection; keep mHC bare and floating."""
 
     def process(self, tensors):
         result = {}
         for name, tensor in tensors.items():
-            if name.endswith((".fn", ".index_kpool_compress_gate")):
+            if name.endswith(".index_kpool_compress_gate"):
                 name += ".weight"
             if name in result:
                 raise ValueError(f"Alias collision: {name}")
