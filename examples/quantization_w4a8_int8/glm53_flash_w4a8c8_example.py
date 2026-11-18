@@ -1,8 +1,11 @@
-"""GLM-5.3-Flash INT: routed INT4/A8, shared and other linears INT8/A8.
+"""GLM-5.3-Flash INT with the ModelSlim best-practice MLP-only scope.
 
 Uses native model_free_ptq on CPU or Ascend, including MTP checkpoint weights.
-C8 is a serving option, not part of this weight conversion. A2/A3 INT8 cache
-uses --kv-cache-dtype int8; A5 cache support must be verified independently.
+Routed MLP experts use INT4/A8; dense/shared MLP projections use INT8/A8.
+Attention, KDA, indexer, router, vision and heads retain floating weights.
+This matches the quantization scope, not ModelSlim's algorithms or transforms.
+KV cache quantization is dynamic and owned by serving, transparent to the model.
+This conversion does not calibrate caches or export offline cache scales.
 Run the separate checkpoint audit before a full-model conversion.
 """
 
@@ -11,6 +14,8 @@ import json
 from pathlib import Path
 
 IGNORE = [
+    r"re:.*visual.*",
+    r"re:.*\.mlp\.gate$",
     r"re:.*norm.*",
     r"re:.*(?:embed_tokens|word_embeddings|position_embeddings|pos_embed).*",
     r"re:.*(?:conv1d|conv_1d|patch_embed\.proj|downsample).*",
@@ -27,8 +32,9 @@ IGNORE = [
 def make_config_groups(algorithm="minmax"):
     groups = {}
     for name, bits, target in (
-        ("routed", 4, r"re:.*\.experts\.\d+\.(gate|up|down)_proj$"),
-        ("shared_and_other", 8, r"re:^(?!.*\.experts\.\d+\.).*$"),
+        ("routed", 4, r"re:.*\.mlp\.experts\.\d+\.(gate|up|down)_proj$"),
+        ("dense", 8, r"re:.*\.mlp\.(gate|up|down)_proj$"),
+        ("shared", 8, r"re:.*\.mlp\.shared_experts\.(gate|up|down)_proj$"),
     ):
         weights = dict(
             num_bits=bits,
@@ -52,7 +58,11 @@ def make_config_groups(algorithm="minmax"):
 
 
 class BareProjectionAliases:
-    """Alias only the supported KPool projection; keep mHC bare and floating."""
+    """Keep the serving KPool name alias; it is outside the quantized scope.
+
+    Current Ascend CT loading uses a Linear wrapper for KPool. Its floating
+    weight must use .weight even though this MLP-only recipe does not quantize it.
+    """
 
     def process(self, tensors):
         result = {}
@@ -103,6 +113,14 @@ def main():
         from huggingface_hub import snapshot_download
 
         source = Path(snapshot_download(args.model, revision=args.revision))
+    source_config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    if source_config.get("quantization_config") or source_config.get(
+        "text_config", {}
+    ).get("quantization_config"):
+        raise ValueError(
+            "Use the original floating-point checkpoint, not a previously "
+            "quantized checkpoint, when changing quantization scope"
+        )
     output = args.save_dir.resolve()
     if source.resolve().is_relative_to(output) or output.is_relative_to(
         source.resolve()
@@ -111,7 +129,7 @@ def main():
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use a fresh empty save-dir")
     if args.device.startswith("npu"):
-        import torch_npu  # noqa: F401; register NPU backend
+        import torch_npu  # noqa: F401
     from compressed_tensors.quantization import QuantizationConfig, QuantizationScheme
 
     from llmcompressor import model_free_ptq
