@@ -1,5 +1,11 @@
 # GLM-5.3-Flash INT: ModelSlim-aligned MLP quantization scope
 
+For forward calibration, see [the native oneshot recipe](README_gptq.md) and
+`glm53_flash_w4a8c8_gptq_example.py`. It provides routed GPTQ, dense/shared
+MinMax and optional MLP-only SmoothQuant, including a lower-memory
+SmoothQuant + MinMax candidate. Its MTP remains floating; it is a
+separate candidate from the model-free example below.
+
 The single Python example uses native `model_free_ptq`. It has no local utility
 imports. Three disjoint recipe groups quantize only MLP projections:
 
@@ -31,6 +37,12 @@ to avoid downloading the model implicitly. `--plan-only` prints the recipe
 without loading weights or frameworks; it does not audit checkpoint headers.
 `--algorithm mse` changes only the routed W4 observer (`norm=2.0`). Each
 candidate must use a fresh output directory and the same original BF16 input.
+For multi-worker MSE conversion, use a checkout with the thread-safe QDQ
+implementation in `src/llmcompressor/observers/grid_search.py`. Older code
+temporarily changed shared weight args to `token`, allowing another worker to
+fail with `Token quantization cannot be applied to weights`. Keep
+`--max-workers 1` as a workaround until that fix is installed; do not change the
+weight recipe from `channel` or the dynamic activation recipe from `token`.
 The CLI rejects a source with a quantization_config. Existing broad-scope INT
 checkpoints cannot acquire floating attention/router/head weights by editing
 their config; generate this candidate from the original BF16 model.

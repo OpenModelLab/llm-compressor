@@ -14,7 +14,6 @@ from compressed_tensors.quantization.utils import calculate_qparams, calculate_r
 from compressed_tensors.quantization.utils.mxfp_utils import (
     should_generate_mx_scales,
 )
-from compressed_tensors.utils import patch_attr
 from compressed_tensors.utils.impl_backend import ImplBackend
 from compressed_tensors.utils.triton import tl, triton
 
@@ -210,14 +209,16 @@ def _fake_quantize_with_observer_qparams(
     """Fake-quantize calibrated groups using the shared TOKEN-strategy path."""
     # The supplied scales are already computed per qparam. TOKEN makes
     # fake_quantize apply those explicit scales to the observed group layout;
-    # patch only this call and restore args' configured strategy afterward.
-    with patch_attr(args, "strategy", QuantizationStrategy.TOKEN):
-        quantized = fake_quantize(
-            observed,
-            scales.unsqueeze(-1),
-            zero_points.unsqueeze(-1),
-            args,
-        )
+    # Each shard may share these args with other conversion workers. Keep the
+    # TOKEN strategy local to QDQ so concurrent weight validation/calibration
+    # always sees the original strategy.
+    qdq_args = args.model_copy(update={"strategy": QuantizationStrategy.TOKEN})
+    quantized = fake_quantize(
+        observed,
+        scales.unsqueeze(-1),
+        zero_points.unsqueeze(-1),
+        qdq_args,
+    )
     return quantized.to(observed.dtype)
 
 
