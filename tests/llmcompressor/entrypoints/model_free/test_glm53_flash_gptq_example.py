@@ -20,6 +20,16 @@ def example_module():
     return module
 
 
+def config_module():
+    path = Path(__file__).resolve().parents[4] / (
+        "examples/quantization_w4a8_int8/glm53_flash_ct_config.py"
+    )
+    spec = importlib.util.spec_from_file_location("glm_ct_config", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_config_keeps_mlp_scope_and_excludes_unloaded_mtp():
     groups = example_module().make_config_groups(2)
     for group in groups.values():
@@ -28,6 +38,10 @@ def test_config_keeps_mlp_scope_and_excludes_unloaded_mtp():
         assert group["input_activations"]["strategy"] == "token"
         assert group["input_activations"]["dynamic"] is True
     patterns = [p[3:] for group in groups.values() for p in group["targets"]]
+    for namespace in ("model.language_model", "language_model.model"):
+        for suffix in ("gate_proj", "experts.0.up_proj", "shared_experts.down_proj"):
+            name = f"{namespace}.layers.1.mlp.{suffix}"
+            assert sum(bool(re.fullmatch(p, name)) for p in patterns) == 1
     for suffix in ("self_attn.q_proj", "mlp.gate", "hc_attn_fn"):
         name = f"model.language_model.layers.1.{suffix}"
         assert not any(re.fullmatch(p, name) for p in patterns)
@@ -242,6 +256,9 @@ def test_real_glm_image_calibration_and_packed_export(
     assert all(count > 0 for count in coverage.values())
     destination = tmp_path / "quantized"
     model.save_pretrained(destination, save_compressed=True)
+    audit = config_module().audit_config(destination)
+    assert audit["projections"] == dict(dense=3, routed=6, shared=3)
+    assert audit["hf_and_vllm_targets"] == "passed"
     saved = {}
     for shard in destination.glob("*.safetensors"):
         saved.update(load_file(shard))
@@ -285,6 +302,7 @@ def test_unloaded_mtp_is_copied_as_float_and_not_targeted(tmp_path):
     )
     destination = tmp_path / "with_mtp"
     model.save_pretrained(destination, save_compressed=True, max_shard_size="4GB")
+    config_module().audit_config(destination)
     key = "model.language_model.layers.2.mlp.experts.0.up_proj.weight"
     found = {}
     for shard in destination.glob("*.safetensors"):

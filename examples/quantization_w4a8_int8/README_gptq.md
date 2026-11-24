@@ -131,6 +131,41 @@ Counts include trace/replay and forced all-expert execution; they are coverage
 diagnostics, not natural routing probabilities or independent token counts.
 The example rejects uncovered targets or an observed GPTQ-to-RTN fallback.
 
+## Export metadata and existing checkpoint repair
+
+Targets accept both HF `model.language_model.layers.N` and Ascend vLLM
+`language_model.model.layers.N` names, while retaining backbone layer IDs.
+The vLLM literal prefix mapper does not rewrite an escaped `re:^model\\.`
+target. Native `group_N` names are valid; group names do not select kernels.
+
+Keep `glm53_flash_ct_config.py` beside the example when copying scripts.
+After compression, the example audits safetensors headers and HF/runtime
+target coverage before declaring the run complete. It checks stored MLP
+dtypes, per-channel scale shapes, ignored quantized projections and floating
+MTP projections accidentally covered by a target. It does not load weight
+tensors or verify kernel numerics. The audit is recorded in the calibration
+report. Existing configs with HF-only regexes or a missing shared target can
+be repaired without repeating calibration:
+
+```bash
+# Run from llm-compressor. Set MODEL to the actual SQMM-V256 directory.
+python examples/quantization_w4a8_int8/glm53_flash_ct_config.py \
+  --model "$MODEL" --repair
+python examples/quantization_w4a8_int8/glm53_flash_ct_config.py \
+  --model "$MODEL"
+```
+
+Repair reconstructs dense/routed/shared targets from existing compatible
+INT8/INT4 schemes, bounded to the configured backbone layers. A missing shared
+scheme can reuse the unique compatible W8A8 scheme only after the checkpoint's
+MLP dtype/scale checks pass. Conflicting schemes, ignored quantized projections,
+non-MLP quantization or missing scales stop the operation before writing.
+The original config is backed up as `config.json.bak_ct_metadata.<UTC timestamp>`;
+the script atomically replaces only `config.json`. Ignore, transforms, cache
+settings, sparsity metadata and weight shards remain unchanged. Already repaired
+configs are left unchanged. This repair is specifically for the backbone-only
+oneshot recipe with floating MTP, not the older model-free MTP-quantized recipe.
+
 ## Validation
 
 The local regression constructs a random tiny GLM with a vision tower, KDA,
@@ -143,7 +178,8 @@ has a separate layout test with a minimal processor stub.
 
 ```bash
 python -m pytest --noconftest -q \
-  tests/llmcompressor/entrypoints/model_free/test_glm53_flash_gptq_example.py
+  tests/llmcompressor/entrypoints/model_free/test_glm53_flash_gptq_example.py \
+  tests/llmcompressor/entrypoints/model_free/test_glm53_flash_ct_config.py
 ```
 
 The full BF16 checkpoint, real processor/image pipeline, direct-load path,
