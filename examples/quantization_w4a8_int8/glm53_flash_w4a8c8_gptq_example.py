@@ -456,6 +456,11 @@ def main():
         dampening_frac=args.dampening_frac,
         routed_method=args.routed_method,
     )
+    # GLM can load sampling fields without do_sample and warn, but saving
+    # validates them strictly. Preserve those values by enabling sampling.
+    gc = model.generation_config
+    if (gc.top_p is not None or gc.temperature is not None) and not gc.do_sample:
+        gc.do_sample = True
     model.save_pretrained(output, save_compressed=True, max_shard_size="4GB")
     export_audit = audit_config(output)
     processor.save_pretrained(output)

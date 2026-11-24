@@ -113,6 +113,20 @@ is unavailable; it can increase loading time and temporary memory.
 
 ## MTP and serving
 
+### Generation configuration when saving
+
+The source GLM generation configuration can contain `top_p=0.95` and
+`temperature=1.0` without `do_sample=True`. Transformers can warn on loading
+and then reject the configuration during strict save validation. The example
+sets `model.generation_config.do_sample = True` before compressed saving when
+sampling fields are present but sampling is disabled. This preserves those
+sampling values and changes the saved Transformers default to sampling; it
+does not modify quantized weights, scales or quantization scope. The guard
+also applies when sampling fields contain their neutral defaults. Evaluation
+sampling parameters should remain explicit and consistent across candidates.
+
+### MTP and KV cache
+
 MTP forward calibration is not supported by the current native pipeline. The
 example deliberately does not attach MTP, restricts targets to backbone layer
 IDs and lets the native saver preserve source MTP tensors in floating point
