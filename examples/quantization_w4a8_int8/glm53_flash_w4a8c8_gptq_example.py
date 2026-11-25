@@ -19,9 +19,7 @@ def make_config_groups(num_layers):
     if num_layers < 1:
         raise ValueError("num_layers must be positive")
     layers = "(?:" + "|".join(str(i) for i in range(num_layers)) + ")"
-    # vLLM's literal prefix mapper cannot rewrite an escaped HF regex target.
-    namespace = r"(?:model\.language_model|language_model\.model)"
-    prefix = rf"re:^{namespace}\.layers\.{layers}\.mlp"
+    prefix = rf"re:^model\.language_model\.layers\.{layers}\.mlp"
     groups = {}
     for name, bits, suffix in (
         ("routed", 4, r"\.experts\.\d+\.(gate|up|down)_proj$"),
@@ -383,8 +381,6 @@ def main():
         return
     if not args.calibration_data:
         parser.error("--calibration-data is required")
-    from glm53_flash_ct_config import audit_config
-
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error(
             "This example is single-process; inference TP is configured separately"
@@ -462,7 +458,6 @@ def main():
     if (gc.top_p is not None or gc.temperature is not None) and not gc.do_sample:
         gc.do_sample = True
     model.save_pretrained(output, save_compressed=True, max_shard_size="4GB")
-    export_audit = audit_config(output)
     processor.save_pretrained(output)
     report = dict(
         algorithm=("smoothquant+" if args.smoothquant else "") + args.routed_method,
@@ -488,7 +483,6 @@ def main():
         device=args.device,
         max_seq_length=args.max_seq_length,
         targets_per_graph=args.targets_per_graph,
-        export_audit=export_audit,
     )
     (output / "calibration_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
