@@ -67,7 +67,7 @@ def test_python_recipe_and_loading(monkeypatch):
     assert modifier.step == example.STEP
     assert not modifier.ignore
     assert len(modifier.targets) == 3
-    weights = modifier.resolved_config.config_groups["group_0"].weights
+    weights = modifier.resolve_quantization_config().config_groups["group_0"].weights
     assert weights.observer == "ssz"
 
 

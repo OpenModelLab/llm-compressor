@@ -32,13 +32,19 @@ class SSZModifier(QuantizationModifier):
                 value = {**value, "scheme": "W8A8"}
         return value
 
-    def resolve_quantization_config(self) -> QuantizationConfig:
+    def resolve_quantization_config(
+        self, has_calibration_data: bool = False
+    ) -> QuantizationConfig:
         if self.weight_observer not in (None, "ssz") or (
             self.observer is not None
             and self.observer.get("weights") not in (None, "ssz")
         ):
             raise ValueError("SSZModifier requires the ssz weight observer")
-        config = super().resolve_quantization_config().model_copy(deep=True)
+        config = (
+            super()
+            .resolve_quantization_config(has_calibration_data=has_calibration_data)
+            .model_copy(deep=True)
+        )
         for scheme in config.config_groups.values():
             weights = scheme.weights
             if weights is None:

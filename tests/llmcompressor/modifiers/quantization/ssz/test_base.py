@@ -31,13 +31,24 @@ pytestmark = pytest.mark.unit
 def test_default_scheme_and_public_export():
     assert ExportedSSZModifier is SSZModifier
     modifier = SSZModifier(step=17)
-    group = modifier.resolved_config.config_groups["group_0"]
+    group = modifier.resolve_quantization_config().config_groups["group_0"]
     assert group.weights.num_bits == 8
     assert group.weights.strategy == "channel"
     assert group.weights.observer == "ssz"
     assert group.weights.observer_kwargs == {"step": 17}
     assert group.input_activations.dynamic is True
     assert not modifier.requires_calibration_data
+
+
+@pytest.mark.parametrize("has_calibration_data", [False, True])
+def test_ssz_observer_is_preserved_with_calibration_data(has_calibration_data):
+    modifier = SSZModifier(step=7)
+    config = modifier.resolve_quantization_config(
+        has_calibration_data=has_calibration_data
+    )
+    weights = config.config_groups["group_0"].weights
+    assert weights.observer == "ssz"
+    assert weights.observer_kwargs == {"step": 7}
 
 
 @pytest.mark.parametrize("step", [0, -1, True, 1.5, "10"])
@@ -59,7 +70,7 @@ def test_explicit_groups_and_static_activation_calibration():
         "input_activations": {"num_bits": 8, "strategy": "tensor"},
     }
     modifier = SSZModifier(config_groups={"group_0": group}, step=10)
-    resolved = modifier.resolved_config.config_groups["group_0"]
+    resolved = modifier.resolve_quantization_config().config_groups["group_0"]
     assert modifier.scheme is None
     assert resolved.weights.observer == "ssz"
     assert resolved.weights.observer_kwargs == {"step": 10}
@@ -127,7 +138,9 @@ def test_factory_and_python_recipe_roundtrip():
     assert isinstance(restored, SSZModifier)
     assert restored.step == 17
     assert restored.ignore == ["lm_head"]
-    assert restored.resolved_config == modifier.resolved_config
+    assert (
+        restored.resolve_quantization_config() == modifier.resolve_quantization_config()
+    )
 
 
 def _args(bits=4, **kwargs):
