@@ -6,6 +6,7 @@ floating MTP. Requires safetensors; no NPU or llmcompressor import is needed.
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ _PROJECTION = re.compile(
     r"(?:(experts\.\d+|shared_experts)\.)?(gate|up|down)_proj$"
 )
 _FLOAT = {"BF16", "F16", "F32", "F64"}
+AUDIT_CONTRACT_VERSION = 2
 
 
 def _family(stem):
@@ -246,6 +248,9 @@ def audit_config(folder, *, repair=False):
                 os.unlink(temporary)
     return dict(
         projections=dict(counts),
+        projection_names_sha256=hashlib.sha256(
+            "\n".join(sorted(_aliases(stem)[0] for stem in projections)).encode()
+        ).hexdigest(),
         hf_and_vllm_targets="passed",
         changed=changed,
         backup=str(backup) if backup else None,

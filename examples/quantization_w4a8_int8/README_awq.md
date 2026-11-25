@@ -81,6 +81,20 @@ the search grid between both methods. Treat changes as separate candidates.
 smoke test, writing to a different directory. `--linearize-after-load` enables
 the existing native fallback loader if direct load-context support is unavailable.
 
+## Generation configuration when saving
+
+As in the GPTQ example, before compressed saving the AWQ example enables
+`model.generation_config.do_sample` when `top_p` or `temperature` is present
+but sampling is disabled. This prevents strict Transformers save validation
+from rejecting inherited GLM sampling fields. The guard also covers neutral
+default values, so the saved Transformers default can change to sampling.
+Weights, scales and AWQ search are unaffected; keep evaluation sampling
+parameters explicit and identical across candidates.
+
+New GLM export examples should check inherited generation configuration and
+strict save/reload behavior too, rather than discovering this issue after a
+long quantization run. See the local `AGENTS.md` for this maintenance requirement.
+
 ## Memory, export and validation
 
 Calibration is one process on one visible accelerator. Inference TP8 does not
