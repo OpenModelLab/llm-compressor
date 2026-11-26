@@ -13,6 +13,7 @@ from llmcompressor.modifiers.transform.smoothquant.utils import (
     LayerMap,
 )
 from llmcompressor.modifiers.transform.utils.hybrid_attention import (
+    _get_config_metadata,
     get_config_layer_types,
 )
 
@@ -126,9 +127,75 @@ def build_qwen3_5_dense_smoothquant_mappings(model: Module) -> list[LayerMap]:
     )
 
 
+def build_glm5_next_smoothquant_mappings(model: Module) -> list[LayerMap]:
+    """
+    Build SmoothQuant mappings for GLM-5.3-Flash (``Glm5Next*``) models.
+
+    FFN-side only (``post_attention_layernorm`` -> MLP projections), matching the
+    msmodelslim ``get_ln_fuse_map`` targets that produce the leading ~2.5pp
+    accuracy gap between llm-compressor and ms W4A4C8 on GLM-5.3-Flash:
+
+    * dense layers balance ``mlp.gate_proj``/``mlp.up_proj`` (no router);
+    * MoE layers balance every routed expert's ``gate_proj``/``up_proj``, the
+      shared experts' ``gate_proj``/``up_proj``, and the ``mlp.gate`` router.
+
+    The dense/MoE split is driven by ``config.mlp_layer_types`` (read through
+    ``text_config`` first, like the Qwen3.5 builders). The router is scoped to
+    MoE layers only because dense layers have no ``mlp.gate`` module -- mixing
+    it into a single unscoped mapping would collapse the per-layer grouping in
+    ``match_modules_set`` (the same collapse fixed for GlmMoeDsa in #2923).
+    """
+    mlp_layer_types = _get_config_metadata(model, "mlp_layer_types")
+    num_layers = _get_config_metadata(model, "num_hidden_layers")
+    if mlp_layer_types is None or num_layers is None:
+        raise ValueError(
+            "GLM-5.3 SmoothQuant mappings require config.mlp_layer_types and "
+            "config.num_hidden_layers (checked on text_config as well)."
+        )
+
+    dense_indices: list[str] = []
+    moe_indices: list[str] = []
+    for layer_idx in range(num_layers):
+        mlp_type = (
+            mlp_layer_types[layer_idx]
+            if layer_idx < len(mlp_layer_types)
+            else "sparse"
+        )
+        (dense_indices if mlp_type == "dense" else moe_indices).append(str(layer_idx))
+
+    mappings: list[LayerMap] = []
+    if dense_indices:
+        joined = "|".join(dense_indices)
+        mappings.append(
+            LayerMap(
+                balance_layers=[
+                    rf"re:.*layers\.({joined})\.mlp\.gate_proj$",
+                    rf"re:.*layers\.({joined})\.mlp\.up_proj$",
+                ],
+                smooth_layers=rf"re:.*layers\.({joined})\.post_attention_layernorm$",
+            )
+        )
+    if moe_indices:
+        joined = "|".join(moe_indices)
+        mappings.append(
+            LayerMap(
+                balance_layers=[
+                    rf"re:.*layers\.({joined})\.mlp\.experts\..*\.gate_proj$",
+                    rf"re:.*layers\.({joined})\.mlp\.experts\..*\.up_proj$",
+                    rf"re:.*layers\.({joined})\.mlp\.shared_experts\.gate_proj$",
+                    rf"re:.*layers\.({joined})\.mlp\.shared_experts\.up_proj$",
+                    rf"re:.*layers\.({joined})\.mlp\.gate$",
+                ],
+                smooth_layers=rf"re:.*layers\.({joined})\.post_attention_layernorm$",
+            )
+        )
+    return mappings
+
+
 SMOOTHQUANT_DYNAMIC_MAPPING_REGISTRY: dict[str, Callable[[Module], list[LayerMap]]] = {
     "Qwen3_5MoeForConditionalGeneration": build_qwen3_5_moe_smoothquant_mappings,
     "Qwen3_5MoeForCausalLM": build_qwen3_5_moe_smoothquant_mappings,
     "Qwen3_5ForCausalLM": build_qwen3_5_dense_smoothquant_mappings,
     "Qwen3_5ForConditionalGeneration": build_qwen3_5_dense_smoothquant_mappings,
+    "Glm5NextForConditionalGeneration": build_glm5_next_smoothquant_mappings,
 }

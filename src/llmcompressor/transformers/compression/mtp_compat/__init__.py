@@ -11,12 +11,14 @@ from compressed_tensors.utils import patch_attr
 from transformers import PretrainedConfig, PreTrainedModel, modeling_layers
 from transformers.modeling_layers import MtpModel
 
+from .glm5_next_for_conditional_generation import Glm5NextMtpModel
 from .glm_moe_dsa_for_causal_lm import GlmMoeDsaMtpModel
 from .qwen3_5_for_conditional_generation import Qwen3_5MtpModel
 
 _MTP_ADAPTERS = {
     "glm_moe_dsa": GlmMoeDsaMtpModel,
     "qwen3_5_text": Qwen3_5MtpModel,
+    "glm5_next_text": Glm5NextMtpModel,
 }
 
 

@@ -105,6 +105,21 @@ class SmoothQuantModifier(Modifier):
     requires_calibration_data: bool = True
 
     smoothing_strength: float = 0.5
+    # Independent weight exponent ``beta`` for the generalized scale
+    # ``s_j = a_j^alpha / w_j^(1-alpha)`` -- when set, ``s_j = a_j^alpha /
+    # w_j^beta``. Defaults to ``None`` (i.e. ``beta = 1 - alpha``), which is the
+    # original SmoothQuant formulation.
+    smoothing_beta: float | None = None
+    # Statistics convention for the activation smoothing term. ``False`` keeps
+    # the original SmoothQuant dynamic range (``max - min``); ``True`` uses the
+    # per-channel absmax (``max(|min|, |max|)``), matching the msmodelslim
+    # FlexSmooth convention used to reproduce GLM-5.x / ms W4A4C8 smoothing.
+    activation_absmax: bool = False
+    # Coefficient applied to the per-channel weight absmax when building the
+    # weight term. Original SmoothQuant uses ``2.0``; msmodelslim FlexSmooth
+    # uses ``1.0``. Combined with ``activation_absmax`` this lets a recipe
+    # reproduce ``s_j = absmax(a)_j^alpha / absmax(w)_j^beta`` exactly.
+    weight_scale_multiplier: float = 2.0
     mappings: list[tuple | list] | None = None
     ignore: list[str] | None = None
     num_calibration_steps: int | None = None
@@ -375,10 +390,21 @@ class SmoothQuantModifier(Modifier):
                 continue
             logger.info(f"Smoothing with {mapping.smooth_name}")
 
-            activation_scales = (  # get dynamic range for each activation channel
-                self.scales_[mapping.smooth_name].max_channel_vals
-                - self.scales_[mapping.smooth_name].min_channel_vals
-            )
+            activation_stats = self.scales_[mapping.smooth_name]
+            if self.activation_absmax:
+                # Per-channel absmax (max(|min|, |max|)), matching msmodelslim
+                # FlexSmooth. RMSNorm outputs are ~zero-mean/symmetric, so this
+                # is ~0.5x the ``max - min`` dynamic range.
+                activation_scales = torch.maximum(
+                    activation_stats.max_channel_vals.abs(),
+                    activation_stats.min_channel_vals.abs(),
+                )
+            else:
+                # Original SmoothQuant: per-channel dynamic range (max - min).
+                activation_scales = (
+                    activation_stats.max_channel_vals
+                    - activation_stats.min_channel_vals
+                )
             smooth_layer = mapping.smooth_layer
             balance_layers = mapping.balance_layers
 
@@ -437,13 +463,21 @@ class SmoothQuantModifier(Modifier):
             scale = layer.weight.abs().max(dim=0, keepdim=True)[0]
             weight_scales.append(scale)
 
-        weight_scales = 2.0 * torch.cat(weight_scales, dim=0).max(dim=0)[0]
+        weight_scales = self.weight_scale_multiplier * torch.cat(
+            weight_scales, dim=0
+        ).max(dim=0)[0]
 
         # SmoothQuant (https://arxiv.org/abs/2211.10438):
-        # s_j = max(|X_j|)^alpha / max(|W_j|)^(1-alpha)
-        # where j is the input channel, alpha is smoothing strength
+        # s_j = max(|X_j|)^alpha / max(|W_j|)^beta
+        # where j is the input channel, alpha is smoothing strength, and beta is
+        # the weight exponent (defaults to 1 - alpha, the original formulation).
+        beta = (
+            self.smoothing_beta
+            if self.smoothing_beta is not None
+            else 1 - self.smoothing_strength
+        )
         scales = activation_scales.pow(self.smoothing_strength) / weight_scales.pow(
-            1 - self.smoothing_strength
+            beta
         )
         return torch.where(weight_scales > 0.0, scales, activation_scales)
 

@@ -35,6 +35,11 @@ from transformers import (
 from llmcompressor.args import parse_args
 from llmcompressor.core.session_functions import active_session
 from llmcompressor.datasets import get_calibration_dataloader
+from llmcompressor.entrypoints.hif8_kv import (
+    DsaHif8ScaleCollector,
+    attach_mtp_calibration_capture,
+    replay_mtp_draft_calibration,
+)
 from llmcompressor.entrypoints.utils import post_process, pre_process
 from llmcompressor.modeling.moe.context import moe_calibration_context
 from llmcompressor.modeling.moe.linearize import get_non_linearized_moes, linearize_moe
@@ -329,11 +334,50 @@ class Oneshot:
                 session.lifecycle.recipe.modifiers, user=user_pipeline
             )
 
-            pipeline(
-                self.model,
-                calibration_dataloader,
-                self.dataset_args,
-            )
+            # Attach the HiF8 DSA Q/K-scale collector before the pipeline runs, so
+            # its forward hooks accumulate per-tensor absmax during the existing
+            # calibration passes (no extra forward, reuses subgraph offloading).
+            # When an MTP draft layer is loaded, also capture the backbone inputs
+            # the draft consumes (ids + pre-final-norm hidden per batch), so the
+            # draft's own scales can be replayed after the backbone pass.
+            dsa_collector = None
+            mtp_capture = None
+            if self.dataset_args.compute_dsa_kv_scale:
+                candidate = DsaHif8ScaleCollector(self.model)
+                if candidate.has_dsa_layers:
+                    dsa_collector = candidate.attach()
+                    mtp_capture = attach_mtp_calibration_capture(self.model)
+                else:
+                    logger.warning(
+                        "`compute_dsa_kv_scale=True` but no DSA (sparse-MLA) "
+                        "latent projection was found; skipping DSA KV scale."
+                    )
+
+            try:
+                pipeline(
+                    self.model,
+                    calibration_dataloader,
+                    self.dataset_args,
+                )
+                if dsa_collector is not None and mtp_capture is not None:
+                    # msmodelslim parity: the draft layer never runs during the
+                    # backbone calibration (it sits outside every traced
+                    # subgraph), so its DSA latent path is replayed over the
+                    # captured inputs while the collector hooks are still
+                    # attached; see hif8_kv.replay_mtp_draft_calibration.
+                    replay_mtp_draft_calibration(
+                        self.model, dsa_collector, mtp_capture
+                    )
+            finally:
+                if mtp_capture is not None:
+                    mtp_capture.detach()
+                if dsa_collector is not None:
+                    dsa_collector.detach()
+
+            if dsa_collector is not None:
+                # Register the static FLOAT32 scales before `session.finalize`
+                # packs the weights, so they are saved untouched as plain buffers.
+                dsa_collector.write_scales()
 
         session.finalize()
 
@@ -441,6 +485,7 @@ def oneshot(
     dataloader_num_workers: int = 0,
     min_tokens_per_module: float | None = None,
     moe_calibrate_all_experts: bool = True,
+    compute_dsa_kv_scale: bool = False,
     pipeline: str | None = "independent",
     use_eager_attention: bool = False,
     tracing_ignore: list[str] = [
@@ -539,6 +584,17 @@ def oneshot(
         model calibration. When True, all experts will see all tokens during
         calibration, ensuring proper quantization statistics. When False, only
         routed experts will be used. Only relevant for MoE models. Default is True.
+    :param compute_dsa_kv_scale: Whether to compute the static HiF8 (HiFloat8) DSA
+        Q/K scales during calibration. When True, llm-compressor hooks the
+        sparse-MLA query/KV layernorms (``q_a_layernorm`` / ``kv_a_layernorm``,
+        the RMSNorm-ed NoPE latents) and writes per-tensor FLOAT32 ``fa_q.scale``
+        and ``fa_k.scale`` buffers (``absmax / 32768``) per DSA layer into the
+        saved checkpoint. When an MTP draft layer is loaded (``model.mtp``),
+        its inputs are captured during the backbone pass and the draft's DSA
+        latent path is replayed afterwards, so the draft layer (e.g.
+        GLM-5.3-Flash's ``layers.45``) receives ``fa_q.scale`` / ``fa_k.scale``
+        as well, matching msmodelslim. Only relevant for sparse-MLA/DSA models
+        (e.g. GLM-5.3). Default is False.
     :param pipeline: Calibration pipeline used to calibrate model Options:
         ['basic', 'datafree', 'sequential', 'independent']
     :param use_eager_attention: Whether to force eager attention during tracing and

@@ -42,7 +42,9 @@ from llmcompressor.modifiers.quantization.calibration import (
     calibrate_value_hook,
     freeze_module_quantization,
     initialize_observer,
+    observe,
     reset_quantization_status,
+    update_qparams,
 )
 from llmcompressor.modifiers.quantization.group_size_validation import (
     validate_group_size_divisibility,
@@ -249,8 +251,19 @@ class QuantizationMixin(HooksMixin):
             untie_word_embeddings(model)
         warn_inference_mode_forwards(model)
 
-        for _, module in match_named_modules(model, self.resolved_targets, self.ignore):
-            self._initialize_observers(module)
+        for name, module in match_named_modules(
+            model, self.resolved_targets, self.ignore
+        ):
+            # MTP draft layers live in the ``model.mtp`` subtree, which the
+            # calibration pipelines never forward (the draft only runs in the
+            # training loss). A data-dependent weight observer (the default
+            # ``imatrix_mse``) therefore has no activation statistics for them
+            # and produces a degenerate scale. The MX scale itself is data-free
+            # (``generate_mx_scales`` uses only the weight block max), so force
+            # the draft's weight observer to ``memoryless_minmax``.
+            self._initialize_observers(
+                module, force_datafree="mtp" in name
+            )
             self._calibration_hooks |= self._initialize_hooks(module)
             apply_calibration_status(module)
 
@@ -292,6 +305,24 @@ class QuantizationMixin(HooksMixin):
                 Event(type_=EventType.SEQUENTIAL_EPOCH_END),
                 modules=remaining,
             )
+
+        # Persistent modules outside every subgraph (e.g. the model.mtp draft
+        # subtree) never get their weight observers passed to
+        # `on_sequential_epoch_end`, so they have no statistics at all (unlike
+        # `remaining` above, which has statistics but was never consumed). Their
+        # weight observers are data-free (memoryless_minmax), so observe the
+        # weight directly here to compute a correct scale instead of leaving the
+        # uninitialized `torch.empty` scale in place.
+        unobserved = [
+            module
+            for name, module in modules.items()
+            if "mtp" in name
+            and (observer := getattr(module, "weight_observer", None)) is not None
+            and not observer.has_statistics
+        ]
+        if unobserved:
+            observe(unobserved, "weight")
+            update_qparams(unobserved, "weight")
 
         for module in modules.values():
             freeze_module_quantization(module)  # remove observers
@@ -555,7 +586,7 @@ class QuantizationMixin(HooksMixin):
         # calibration data is available.
         return "imatrix_mse" if has_calibration_data else "memoryless_minmax"
 
-    def _initialize_observers(self, module: torch.nn.Module):
+    def _initialize_observers(self, module: torch.nn.Module, force_datafree: bool = False):
         if not hasattr(module, "quantization_scheme"):
             return
 
@@ -581,7 +612,7 @@ class QuantizationMixin(HooksMixin):
 
         # weight observers (used by child modifier or `observe` and `update_qparams`)
         if weight:
-            initialize_observer(module, base_name="weight")
+            initialize_observer(module, base_name="weight", force_datafree=force_datafree)
 
         # output activations
         if output:

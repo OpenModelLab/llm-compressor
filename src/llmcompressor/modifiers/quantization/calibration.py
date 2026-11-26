@@ -36,6 +36,7 @@ __all__ = [
 def initialize_observer(
     module: Module,
     base_name: str,
+    force_datafree: bool = False,
 ):
     """
     Initialize observer module and attach as submodule.
@@ -47,7 +48,11 @@ def initialize_observer(
 
     :param module: torch.nn.Module that the observer is being attached to
     :param base_name: str used to name the observer attribute
-
+    :param force_datafree: force the weight observer to a data-free observer
+        (memoryless_minmax). Used for modules that never run during calibration
+        (e.g. MTP draft layers living outside the traced forward graph), where a
+        data-dependent observer such as ``imatrix_mse`` would have no activation
+        statistics and would produce a degenerate MX scale.
     """
     if base_name == "weight":
         arg_name = "weights"
@@ -81,6 +86,13 @@ def initialize_observer(
             f"({args.observer} -> {observer})",
             log_once=True,
         )
+    if base_name == "weight" and force_datafree:
+        # MTP draft layers (model.mtp subtree) are not forwarded during the
+        # calibration pipelines, so a data-dependent weight observer cannot
+        # accumulate activation statistics. The MX (MXFP4/MXFP8) scale itself
+        # is data-free (generate_mx_scales uses only the weight block max), so
+        # memoryless_minmax produces the correct scale without activations.
+        observer = "memoryless_minmax"
 
     if args is not None and args.dynamic is not True:
         observer = Observer.load_from_registry(observer, base_name=base_name, args=args)

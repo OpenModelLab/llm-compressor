@@ -223,6 +223,25 @@ class DatasetArguments(CustomDatasetArguments):
             ),
         },
     )
+    compute_dsa_kv_scale: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to compute the static HiF8 (HiFloat8) DSA Q/K scales "
+                "during calibration. When True, llm-compressor hooks the "
+                "sparse-MLA query/KV layernorms (``q_a_layernorm`` / "
+                "``kv_a_layernorm``, the RMSNorm-ed NoPE latents) and writes "
+                "per-tensor FLOAT32 ``fa_q.scale`` and ``fa_k.scale`` buffers "
+                "(``absmax / 32768``) per DSA layer into the saved checkpoint. "
+                "When an MTP draft layer is loaded, its inputs are captured "
+                "during the backbone pass and the draft's DSA latent path is "
+                "replayed afterwards, so the draft (e.g. GLM-5.3-Flash's "
+                "layers.45) receives scales too, matching msmodelslim. Only "
+                "relevant for sparse-MLA/DSA models (e.g. GLM-5.3). Default "
+                "is False."
+            ),
+        },
+    )
     # --- pipeline arguments --- #
     pipeline: str | None = field(
         default="independent",

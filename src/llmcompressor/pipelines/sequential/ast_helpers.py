@@ -8,6 +8,8 @@ import traceback
 from types import FunctionType
 from typing import Callable
 
+import __future__
+
 import torch
 from compressed_tensors.utils import patch_attr
 
@@ -117,7 +119,18 @@ def autowrap_forward(module: torch.nn.Module, ignore: list[str]):
 
     # compile new forward function from autowrapped code
     filename = f"<Autowrapped {module.__class__.__name__} {id(module)}>"
-    code = compile(source, filename=filename, mode="exec")
+    # `inspect.getsource` only returns the `def` block, not the module-level
+    # `from __future__ import annotations`. Without that flag, annotations which
+    # reference names imported only under `TYPE_CHECKING` (e.g. `MtpCache` in
+    # transformers' `MtpModel.forward`) are evaluated eagerly at compile time and
+    # raise `NameError`. Re-apply the future flag so annotations stay lazy strings,
+    # matching the original module's behavior.
+    code = compile(
+        source,
+        filename=filename,
+        mode="exec",
+        flags=__future__.annotations.compiler_flag,
+    )
     with append_autowrap_source_on_fail():
         exec(code, namespace)  # ensure ns of functions is the same ns as torch.fx.wrap
 
