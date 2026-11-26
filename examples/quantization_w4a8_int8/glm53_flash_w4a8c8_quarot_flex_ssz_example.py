@@ -2,8 +2,8 @@
 
 Reuses native llm-compressor oneshot, Hadamard, FlexSmooth search, SSZ and CT
 export. GLM53 topology glue lives beside this example, not in framework src/.
-MTP is NOT yet adapted; an MTP source requires explicit --disable-mtp. This is
-an algorithm-chain-aligned backbone experiment, not full reference MTP parity.
+The calibration graph includes single-step MTP and native image embeddings.
+Image messages are an explicit data extension to the raw-token reference.
 """
 
 import argparse
@@ -23,6 +23,13 @@ def read_raw_calibration(path, limit=None):
         if path.suffix.lower() == ".json"
         else [json.loads(line) for line in text.splitlines() if line.strip()]
     )
+    if isinstance(records, list):
+        records = [
+            record.get("inputs_pretokenized", record)
+            if isinstance(record, dict)
+            else record
+            for record in records
+        ]
     if (
         not isinstance(records, list)
         or not records
@@ -50,8 +57,13 @@ def raw_dataloader(records, tokenizer, max_seq_length):
     return DataLoader(RawDataset(), batch_size=None, num_workers=0)
 
 
-def preprocess(model, processor, loader, *, loss_chunk_tokens=4096):
+def preprocess(
+    model, processor, loader, *, loss_chunk_tokens=4096, reference_graph=False
+):
     """Separate lifecycles guarantee collection uses the rotated model."""
+    from contextlib import nullcontext
+
+    from glm53_flash_calibration import calibration_graph
     from glm53_flash_preprocessing import (
         Glm53FlexSmoothModifier,
         Glm53QuaRotModifier,
@@ -78,21 +90,26 @@ def preprocess(model, processor, loader, *, loss_chunk_tokens=4096):
         loss_chunk_tokens=loss_chunk_tokens, strict_recipe=True
     )
     started = perf_counter()
-    oneshot(
-        model=model,
-        processor=processor,
-        recipe=smoothing,
-        dataset=loader,
-        pipeline="sequential",
-        sequential_targets=["Glm5NextTextDecoderLayer"],
-        sequential_targets_per_subgraph=1,
-        sequential_offload_device="cpu",
-        # Keep the observed forward outputs for downstream statistics. Smoothing
-        # is applied after capture; replaying rounded BF16 updates changes the
-        # calibration trajectory even though the transform is float-equivalent.
-        propagate_error=False,
-        tie_word_embeddings=False,
-    )
+    with calibration_graph(model) if reference_graph else nullcontext():
+        oneshot(
+            model=model,
+            processor=processor,
+            recipe=smoothing,
+            dataset=loader,
+            pipeline="sequential",
+            sequential_targets=[
+                "Glm5NextTextDecoderLayer",
+                "Glm53MTPDecoder",
+                "Glm5NextVisionBlock",
+                "Glm5NextVisionPatchMerger",
+            ],
+            sequential_targets_per_subgraph=1,
+            sequential_offload_device="cpu",
+            # Preserve the outputs captured before the smoothing writeback.
+            propagate_error=False,
+            moe_calibrate_all_experts=not reference_graph,
+            tie_word_embeddings=False,
+        )
     timings["flex_smooth_seconds"] = perf_counter() - started
     return matrices, smoothing.diagnostics, timings
 
@@ -166,15 +183,14 @@ def main():
         ):
             parser.error("Start from original, unquantized and untransformed BF16")
     mtp = text_config.get("num_nextn_predict_layers", 0) or 0
-    if mtp and not args.disable_mtp:
-        parser.error(
-            "MTP is not adapted. Use --disable-mtp for a backbone experiment, "
-            "or the original reference recipe for MTP parity"
-        )
+    if mtp not in (0, 1):
+        parser.error("Only a single next-token predictor is supported")
+    if mtp and args.disable_mtp:
+        parser.error("The complete recipe includes MTP; omit --disable-mtp")
     from glm53_flash_quantization import strict_groups
     from glm53_flash_w4a8c8_ssz_example import expected_mlp_projections
 
-    expected_mlp_projections(config)
+    expected_mlp_projections(config, include_mtp=True)
     if args.plan_only:
         print(
             json.dumps(
@@ -192,7 +208,7 @@ def main():
                     online=False,
                     down_proj_online_layers=[],
                     config_groups=strict_groups(
-                        text_config["num_hidden_layers"], args.step
+                        text_config["num_hidden_layers"] + mtp, args.step
                     ),
                     calibration_protocol=(
                         "image messages -> processor chat template"
@@ -200,12 +216,12 @@ def main():
                         else "raw strings -> tokenizer; no chat template"
                     ),
                     full_reference_recipe=False,
-                    alignment_scope="backbone algorithms",
+                    alignment_scope="backbone and single-step MTP",
                     numeric_contract=(
                         "reference data-free weight kernels; "
                         "full-tensor Flex; dense rotations"
                     ),
-                    mtp="disabled" if mtp else "absent",
+                    mtp="single-step" if mtp else "absent",
                 ),
                 indent=2,
             )
@@ -253,7 +269,7 @@ def main():
         parser.error(
             "CPU mode requires accelerators hidden; avoid implicit device selection"
         )
-    from glm53_flash_w4a8c8_gptq_example import load_model
+    from glm53_flash_calibration import load_recipe_model
     from glm53_flash_w4a8c8_ssz_example import (
         environment_report,
         prepare_generation_config,
@@ -306,6 +322,11 @@ def main():
         protocol="image messages; processor chat template; seed-42 shuffle"
         if args.calibration_format == "messages"
         else "raw strings; tokenizer; original order; no template",
+        raw_texts_sha256=hashlib.sha256(
+            json.dumps(records, ensure_ascii=False).encode()
+        ).hexdigest()
+        if args.calibration_format == "raw"
+        else None,
     )
     if args.calibration_check_only:
         print(
@@ -316,7 +337,7 @@ def main():
         return
     offload.mkdir(parents=True, exist_ok=True)
     started = perf_counter()
-    model = load_model(
+    model = load_recipe_model(
         source,
         torch.bfloat16,
         linearize_after_load=args.linearize_after_load,
@@ -327,12 +348,22 @@ def main():
     prepare_generation_config(model.generation_config)
     model.eval()
     model.config.get_text_config().use_cache = False
-    model.config.get_text_config().num_nextn_predict_layers = 0
-    matrices, diagnostics, timings = preprocess(model, processor, loader)
-    result = quantize_mlp(model, processor, args.step, strict_recipe=True)
+    matrices, diagnostics, timings = preprocess(
+        model, processor, loader, reference_graph=True
+    )
+    result = quantize_mlp(
+        model, processor, args.step, strict_recipe=True, include_mtp=True
+    )
     started = perf_counter()
     model.save_pretrained(output, save_compressed=True, max_shard_size="4GB")
-    audit = validate_export(output, result, repair=True)
+    exported_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    exported_config["architectures"] = ["Glm5NextForConditionalGeneration"]
+    if mtp:
+        exported_config["quantization_config"]["is_rot_used"] = True
+    (output / "config.json").write_text(
+        json.dumps(exported_config, indent=2) + "\n", encoding="utf-8"
+    )
+    audit = validate_export(output, result, repair=True, include_mtp=True)
     processor.save_pretrained(output)
     # These are reproducibility assets, not additional checkpoint model keys.
     # Backbone transforms are fully folded into ordinary weights and norm gains.
@@ -342,8 +373,22 @@ def main():
     report = dict(
         completion_status="complete",
         full_reference_recipe=False,
+        reference_algorithm_contract=args.calibration_format == "raw",
+        export_and_serving_differences=[
+            "compressed-tensors",
+            "runtime dynamic INT8 cache",
+        ],
         algorithm_chain_complete=True,
-        alignment_scope="GLM53 backbone",
+        alignment_scope="GLM53 backbone and single-step MTP",
+        calibration_graph=(
+            "fixed-index FP32 sparse attention; simplified KDA; "
+            "routed-only MoE; single-step MTP"
+        )
+        if args.calibration_format == "raw"
+        else (
+            "native image encoder and placeholder insertion; fixed-index sparse "
+            "attention; simplified KDA; routed-only MoE; single-step MTP"
+        ),
         algorithm="offline QuaRot -> FlexSmooth -> MinMax/SSZ/MinMax",
         numeric_contract=dict(
             weight_qparams="strict symmetric endpoints and storage-dtype fitting",
@@ -352,8 +397,16 @@ def main():
             flex_search="full-tensor native source-equivalent proxy",
             calibration_propagation="captured outputs before smoothing writeback",
             rotation="seeded Hadamard; dense FP32 application",
+            mlp_calibration="unclipped FP32 SiLU/product/down; output in input dtype",
         ),
-        mtp="disabled",
+        calibration_precision_equivalence_verified=False,
+        calibration_precision_boundary=(
+            "Explicit FP32 down-weight promotion is an example-local compatibility "
+            "choice. The reference Python caller passes FP32 activation to a BF16 "
+            "Linear without autocast; CPU rejects this mixed dtype. NPU execution "
+            "equivalence has not been established."
+        ),
+        mtp="single-step" if mtp else "absent",
         source_mtp_layers=mtp,
         runtime_cache="dynamic-int8",
         rotation=dict(seed=1234, precision="float32", online=False, block_size=None),
@@ -395,6 +448,7 @@ def main():
             for name in (
                 Path(__file__).name,
                 "glm53_flash_preprocessing.py",
+                "glm53_flash_calibration.py",
                 "glm53_flash_quantization.py",
                 "glm53_flash_w4a8c8_ssz_example.py",
                 "glm53_flash_w4a8c8_gptq_example.py",

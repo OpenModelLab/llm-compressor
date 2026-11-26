@@ -1,6 +1,6 @@
 """Example-local GLM53 adapters for native QuaRot and FlexSmooth arithmetic.
 
-GLM53 backbone geometry; MTP requires a separate topology adapter.
+GLM53 backbone and single-step MTP geometry.
 """
 
 import math
@@ -46,6 +46,12 @@ class ParameterRef:
     key: str
 
 
+@dataclass(frozen=True)
+class SplitNormFusion:
+    norm: tuple[str, str]
+    consumers: tuple[str, ...]
+
+
 def parameter_ref(model, path):
     """Resolve a normal weight or an actual bare Parameter without wrapping it."""
     try:
@@ -70,13 +76,14 @@ def build_glm53_plans(model):
     if is_distributed():
         raise ValueError("This GLM53 example adapter is single-process")
     config = model.config.get_text_config()
-    if getattr(config, "num_nextn_predict_layers", 0):
-        raise ValueError("GLM53 preprocessing requires MTP explicitly disabled")
+    from glm53_flash_calibration import mtp_count
+
+    nextn = mtp_count(config)
     if config.qk_rope_head_dim != 0:
         raise ValueError("This GLM53 adapter requires the legal NoPE geometry")
     prefix = "model.language_model"
     layers = model.get_submodule(f"{prefix}.layers")
-    if len(layers) != config.num_hidden_layers:
+    if len(layers) != config.num_hidden_layers + nextn:
         raise ValueError("Unexpected decoder count")
     hidden, query, kv = config.hidden_size, config.q_lora_rank, config.kv_lora_rank
     value, key, heads = (
@@ -131,6 +138,8 @@ def build_glm53_plans(model):
     for index, layer in enumerate(layers):
         base = f"{prefix}.layers.{index}"
         attention = f"{base}.self_attn"
+        is_mtp = index >= config.num_hidden_layers
+        rotate_unfused_gate = None
         if layer.block_type == "linear_attention":
             inputs = [
                 f"{attention}.{name}"
@@ -152,12 +161,24 @@ def build_glm53_plans(model):
             weight(kvb, kv, heads * (key + value))
             weight(f"{attention}.o_proj", heads * value, hidden)
             inputs, query_consumers = [qa, kva], [qb]
-            if layer.self_attn.indexer is not None:
+            indexer_types = getattr(config, "indexer_types", ())
+            has_indexer = layer.self_attn.indexer is not None and (
+                is_mtp
+                or index < len(indexer_types)
+                and indexer_types[index] != "shared"
+            )
+            if has_indexer:
                 inputs += [
                     f"{attention}.indexer.wk",
                     f"{attention}.indexer.weights_proj",
-                    f"{attention}.indexer.index_kpool_compress_gate",
                 ]
+                gate = f"{attention}.indexer.index_kpool_compress_gate"
+                if config.index_kpool > 1 and getattr(
+                    config, "index_kpool_compress", False
+                ):
+                    inputs.append(gate)
+                else:
+                    rotate_unfused_gate = gate
                 query_consumers.append(f"{attention}.indexer.wq_b")
             fuse(f"{attention}.q_a_layernorm", query_consumers, query, smooth=True)
             fuse(f"{attention}.kv_a_layernorm", [kvb], kv)
@@ -173,16 +194,19 @@ def build_glm53_plans(model):
         fuse(f"{base}.input_layernorm", inputs, hidden, smooth=True)
         for name in inputs:
             rotate(name, "rot", 1)
+        if rotate_unfused_gate:
+            rotate(rotate_unfused_gate, "rot", 1)
         weight(f"{attention}.o_proj", outputs=hidden)
         rotate(f"{attention}.o_proj", "rot", 0)
-        for connection in ("attn_hc", "ffn_hc"):
+        for connection in () if is_mtp else ("attn_hc", "ffn_hc"):
             weight(f"{base}.{connection}.fn", inputs=hidden * config.hc_mult)
             rotate(f"{base}.{connection}.fn", "rot", 1)
         mlp = f"{base}.mlp"
-        if config.mlp_layer_types[index] == "dense":
+        mlp_type = "sparse" if is_mtp else config.mlp_layer_types[index]
+        if mlp_type == "dense":
             experts = [mlp]
             consumers = []
-        elif config.mlp_layer_types[index] == "sparse":
+        elif mlp_type == "sparse":
             experts = [f"{mlp}.experts.{i}" for i in range(config.n_routed_experts)]
             experts.append(f"{mlp}.shared_experts")
             consumers = [f"{mlp}.gate"]
@@ -195,6 +219,25 @@ def build_glm53_plans(model):
         fuse(f"{base}.post_attention_layernorm", consumers, hidden)
         for name in consumers:
             rotate(name, "rot", 1)
+        if is_mtp:
+            for name in ("enorm", "hnorm"):
+                norm = model.get_submodule(f"{base}.{name}")
+                if type(
+                    norm
+                ).__name__ != "Glm5NextTextRMSNorm" or norm.weight.shape != (hidden,):
+                    raise ValueError(f"Incompatible MTP norm: {base}.{name}")
+            weight(f"{base}.eh_proj", 2 * hidden, hidden)
+            fusions.append(
+                SplitNormFusion(
+                    (f"{base}.enorm", f"{base}.hnorm"), (f"{base}.eh_proj",)
+                )
+            )
+            fuse(f"{base}.shared_head.norm", [f"{base}.shared_head.head"], hidden)
+            weight(f"{base}.embed_tokens", inputs=hidden)
+            rotate(f"{base}.embed_tokens", "rot", 1)
+            rotate(f"{base}.eh_proj", "rot", 1)
+            rotate(f"{base}.eh_proj", "rot", 0)
+            rotate(f"{base}.shared_head.head", "rot", 1)
     fuse(f"{prefix}.norm", ["lm_head"], hidden)
     # The visual tower stays unquantized. Its final output must nevertheless
     # enter the same residual basis as the rotated text embeddings.
@@ -218,7 +261,11 @@ def build_glm53_plans(model):
         tuple(rotations),
     )
     targets = {op.target for op in (plan.embedding, *plan.rotations)}
-    targets.update(f.norm for f in fusions)
+    targets.update(
+        name
+        for f in fusions
+        for name in (f.norm if isinstance(f.norm, tuple) else (f.norm,))
+    )
     identities = {}
     for name in sorted(targets):
         ref = parameter_ref(model, name)
@@ -326,23 +373,51 @@ class Glm53QuaRotModifier(Modifier):
             return
         metadata = dict(
             status="in_progress",
-            topology="glm53_backbone",
+            topology="glm53_backbone_and_mtp",
             precision="float32",
             seed=1234,
             block_size=None,
             online=False,
-            mtp="disabled",
+            mtp="single-step"
+            if getattr(model.config.get_text_config(), "num_nextn_predict_layers", 0)
+            else "absent",
         )
         model.config.quarot_config = metadata
         started = perf_counter()
         try:
+            if getattr(model.config.get_text_config(), "num_nextn_predict_layers", 0):
+                # Restore the original final-norm gain in the rotated basis
+                # before serving MTP's hnorm. This is a checkpoint tensor.
+                final_norm = model.get_submodule("model.language_model.norm")
+                with align_module_device(final_norm):
+                    gain = final_norm.weight.detach().float().cpu()
+                    basis = self._matrices["rot"].to_dense().cpu()
+                    correction = ((basis.T * gain) @ basis).to(final_norm.weight.dtype)
+                if hasattr(model, "rot"):
+                    raise ValueError("Start from a source without an MTP correction")
+                model.rot = nn.Linear(
+                    gain.numel(), gain.numel(), bias=False, dtype=correction.dtype
+                )
+                model.rot.weight = nn.Parameter(correction, requires_grad=False)
+                metadata["mtp_input_correction"] = "rot.weight"
             for fusion in self._plan.fusions:
-                norm = model.get_submodule(fusion.norm)
-                with align_module_device(norm):
-                    gain = norm.weight.detach().float().cpu().clone()
+                norms = [
+                    model.get_submodule(name)
+                    for name in (
+                        fusion.norm
+                        if isinstance(fusion.norm, tuple)
+                        else (fusion.norm,)
+                    )
+                ]
+                gains = []
+                for norm in norms:
+                    with align_module_device(norm):
+                        gains.append(norm.weight.detach().float().cpu().clone())
+                gain = torch.cat(gains)
                 for name in fusion.consumers:
                     _multiply_parameter(model, name, gain)
-                update_offload_parameter(norm, "weight", torch.ones_like(gain))
+                for norm, original in zip(norms, gains):
+                    update_offload_parameter(norm, "weight", torch.ones_like(original))
             operations = (self._plan.embedding, *self._plan.rotations)
             for index, op in enumerate(operations, 1):
                 ref = parameter_ref(model, op.target)
@@ -356,6 +431,9 @@ class Glm53QuaRotModifier(Modifier):
                     matrix = self._matrices[op.space]
                     if self.strict_recipe:
                         matrix = matrix.to_dense()
+                        if op.target.endswith(".eh_proj") and op.axis == 1:
+                            matrix = torch.block_diag(matrix, matrix)
+                            options["stride"] = matrix.shape[0]
                     updated = rotate_axis(
                         getattr(ref.owner, ref.key), matrix, **options
                     )

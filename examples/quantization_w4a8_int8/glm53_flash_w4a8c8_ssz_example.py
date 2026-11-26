@@ -31,7 +31,7 @@ def make_ssz_groups(num_layers, step):
     return groups
 
 
-def expected_mlp_projections(config):
+def expected_mlp_projections(config, *, include_mtp=False):
     """Derive the complete backbone scope independently of regex matching."""
     text = config.get("text_config", config)
     if not isinstance(text, dict):
@@ -48,6 +48,12 @@ def expected_mlp_projections(config):
     ):
         raise ValueError("Expected one dense/sparse mlp_layer_types entry per layer")
     experts, shared = text.get("n_routed_experts"), text.get("n_shared_experts")
+    if include_mtp:
+        from types import SimpleNamespace
+
+        from glm53_flash_calibration import mtp_count
+
+        types = [*types, *(["sparse"] * mtp_count(SimpleNamespace(**text)))]
     if "sparse" in types and any(
         not isinstance(value, int) or isinstance(value, bool) or value < 1
         for value in (experts, shared)
@@ -114,8 +120,8 @@ def environment_report():
     )
 
 
-def validate_export(output, scope, *, repair=False):
-    audit = audit_config(output, repair=repair)
+def validate_export(output, scope, *, repair=False, include_mtp=False):
+    audit = audit_config(output, repair=repair, include_mtp=include_mtp)
     if (
         any(
             audit["projections"].get(name, 0) != count
@@ -127,7 +133,7 @@ def validate_export(output, scope, *, repair=False):
     return audit
 
 
-def quantize_mlp(model, processor, step=50, *, strict_recipe=False):
+def quantize_mlp(model, processor, step=50, *, strict_recipe=False, include_mtp=False):
     """Apply the YAML's three weight quantizers through native data-free oneshot."""
     from compressed_tensors.offload import OffloadCache
 
@@ -137,12 +143,18 @@ def quantize_mlp(model, processor, step=50, *, strict_recipe=False):
         raise ValueError("step must be positive")
     if any(getattr(m, "quantization_scheme", None) for m in model.modules()):
         raise ValueError("Start from an unquantized floating model")
-    groups = make_ssz_groups(model.config.get_text_config().num_hidden_layers, step)
+    config = model.config.get_text_config()
+    count = config.num_hidden_layers
+    if include_mtp:
+        from glm53_flash_calibration import mtp_count
+
+        count += mtp_count(config)
+    groups = make_ssz_groups(count, step)
     if strict_recipe:
         from glm53_flash_quantization import strict_groups
 
-        groups = strict_groups(model.config.get_text_config().num_hidden_layers, step)
-    expected = expected_mlp_projections(model.config.to_dict())
+        groups = strict_groups(count, step)
+    expected = expected_mlp_projections(model.config.to_dict(), include_mtp=include_mtp)
     modules = quantized_modules(model, groups)
     missing, extra = (
         sorted(expected.keys() - modules.keys()),

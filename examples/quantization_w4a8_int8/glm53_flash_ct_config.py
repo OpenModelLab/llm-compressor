@@ -1,7 +1,8 @@
-"""Audit/repair GLM backbone MLP CT metadata without loading weight tensors.
+"""Audit/repair GLM MLP CT metadata without loading weight tensors.
 
-Use with the forward-calibrated example: routed INT4, dense/shared INT8,
-floating MTP. Requires safetensors; no NPU or llmcompressor import is needed.
+Use with the forward-calibrated example: routed INT4, dense/shared INT8.
+MTP stays floating by default; --include-mtp audits its quantized projections
+and runtime naming too. Requires safetensors; no NPU/llmcompressor import needed.
 """
 
 import argparse
@@ -31,9 +32,14 @@ def _family(stem):
     return "shared" if kind == "shared_experts" else "routed"
 
 
-def _aliases(name):
+def _aliases(name, include_mtp=False):
     hf = name.replace("language_model.model.", "model.language_model.", 1)
-    return hf, hf.replace("model.language_model.", "language_model.model.", 1)
+    result = (hf, hf.replace("model.language_model.", "language_model.model.", 1))
+    return (
+        (*result, hf.replace("model.language_model.", "model.", 1))
+        if include_mtp
+        else result
+    )
 
 
 def _matches(name, targets):
@@ -134,12 +140,13 @@ def _projections(tensors, num_layers):
     return projections, counts
 
 
-def _repair_groups(quantization, projections, num_layers):
+def _repair_groups(quantization, projections, num_layers, include_mtp=False):
     old_groups = list(quantization["config_groups"].values())
     layers = "(?:" + "|".join(map(str, range(num_layers))) + ")"
-    prefix = (
-        rf"re:^(?:model\.language_model|language_model\.model)\.layers\.{layers}\.mlp"
-    )
+    namespaces = r"model\.language_model|language_model\.model"
+    if include_mtp:
+        namespaces += r"|model"
+    prefix = rf"re:^(?:{namespaces})\.layers\.{layers}\.mlp"
     result = {}
     for family, bits, suffix in (
         ("dense", 8, r"\.(gate|up|down)_proj$"),
@@ -173,7 +180,7 @@ def _repair_groups(quantization, projections, num_layers):
     return result
 
 
-def audit_config(folder, *, repair=False):
+def audit_config(folder, *, repair=False, include_mtp=False):
     """Check header dtype/scale and HF/runtime target coverage; optionally fix config.
 
     No weight values are read or written. This does not verify NPU kernels,
@@ -197,11 +204,16 @@ def audit_config(folder, *, repair=False):
     num_layers = text.get("num_hidden_layers", 0)
     if not isinstance(num_layers, int) or num_layers < 1:
         raise ValueError("Missing positive num_hidden_layers")
+    if include_mtp:
+        nextn = text.get("num_nextn_predict_layers", 0) or 0
+        if nextn not in (0, 1):
+            raise ValueError("Expected at most one next-token predictor")
+        num_layers += nextn
     tensors = _metadata(folder)
     projections, counts = _projections(tensors, num_layers)
     if repair:
         quantization["config_groups"] = _repair_groups(
-            quantization, projections, num_layers
+            quantization, projections, num_layers, include_mtp
         )
     groups = list(quantization["config_groups"].values())
     for name in tensors:
@@ -215,7 +227,7 @@ def audit_config(folder, *, repair=False):
                     raise ValueError(f"Floating MTP projection is targeted: {alias}")
     for stem in projections:
         bits = 4 if ".experts." in stem else 8
-        for alias in _aliases(stem):
+        for alias in _aliases(stem, include_mtp):
             if _matches(alias, quantization.get("ignore", [])):
                 raise ValueError(f"Quantized checkpoint projection is ignored: {alias}")
             matched = [g for g in groups if _matches(alias, g["targets"])]
@@ -260,11 +272,17 @@ def audit_config(folder, *, repair=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--include-mtp", action="store_true")
     parser.add_argument(
         "--repair", action="store_true", help="Back up and fix config.json"
     )
     args = parser.parse_args()
-    print(json.dumps(audit_config(args.model, repair=args.repair), indent=2))
+    print(
+        json.dumps(
+            audit_config(args.model, repair=args.repair, include_mtp=args.include_mtp),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

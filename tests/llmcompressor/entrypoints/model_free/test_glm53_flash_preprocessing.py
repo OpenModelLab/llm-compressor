@@ -20,7 +20,7 @@ def example_modules(monkeypatch):
     return preprocessing, example
 
 
-def tiny_glm(tmp_path):
+def tiny_glm(tmp_path, *, with_mtp=False):
     from transformers import Glm5NextForConditionalGeneration
 
     from llmcompressor.modeling.moe.linearize import linearize_moe
@@ -33,8 +33,15 @@ def tiny_glm(tmp_path):
     config = old.config
     config.text_config.q_lora_rank = 32  # native shifted Hadamard has 32-wide blocks
     config.text_config.index_topk = 16
-    config.text_config.num_nextn_predict_layers = 0
-    model = linearize_moe(Glm5NextForConditionalGeneration(config).float()).eval()
+    config.text_config.index_kpool_compress = True
+    config.text_config.num_nextn_predict_layers = int(with_mtp)
+    if with_mtp:
+        from glm53_flash_calibration import Glm53RecipeModel
+
+        model = Glm53RecipeModel(config)
+    else:
+        model = Glm5NextForConditionalGeneration(config)
+    model = linearize_moe(model.float()).eval()
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if parameter.ndim == 1 and name.endswith("norm.weight"):
@@ -169,24 +176,16 @@ def test_bf16_smoothing_keeps_observed_outputs_for_downstream_statistics(
     )
 
 
-def test_mtp_is_rejected_before_any_transform(tmp_path, example_modules, monkeypatch):
+def test_missing_mtp_weights_are_rejected_before_transform(tmp_path, example_modules):
     preprocessing, example = example_modules
     model, _ = tiny_glm(tmp_path)
     model.config.text_config.num_nextn_predict_layers = 1
     original = model.model.language_model.embed_tokens.weight.clone()
-    with pytest.raises(ValueError, match="MTP explicitly disabled"):
+    with pytest.raises(ValueError, match="Unexpected decoder count"):
         preprocessing.build_glm53_plans(model)
     torch.testing.assert_close(
         model.model.language_model.embed_tokens.weight, original, rtol=0, atol=0
     )
-    source = tmp_path / "source"
-    config = json.loads((source / "config.json").read_text())
-    config["text_config"]["num_nextn_predict_layers"] = 1
-    (source / "config.json").write_text(json.dumps(config))
-    monkeypatch.setattr(sys, "argv", ["example", "--model", str(source), "--plan-only"])
-    with pytest.raises(SystemExit) as failure:
-        example.main()
-    assert failure.value.code == 2
 
 
 def test_raw_calibration_preserves_order_and_rejects_messages(
@@ -201,9 +200,12 @@ def test_raw_calibration_preserves_order_and_rejects_messages(
         example.read_raw_calibration(path)
 
 
-@pytest.mark.parametrize("calibration_format", ["raw", "messages"])
+@pytest.mark.parametrize(
+    "calibration_format,with_mtp",
+    [("raw", False), ("messages", False), ("raw", True), ("messages", True)],
+)
 def test_actual_cli_writes_five_stage_manifest(
-    tmp_path, example_modules, monkeypatch, calibration_format
+    tmp_path, example_modules, monkeypatch, calibration_format, with_mtp
 ):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -211,7 +213,7 @@ def test_actual_cli_writes_five_stage_manifest(
     from transformers import AutoProcessor, GenerationConfig, PreTrainedTokenizerFast
 
     _, example = example_modules
-    model, helper = tiny_glm(tmp_path)
+    model, helper = tiny_glm(tmp_path, with_mtp=with_mtp)
     source, output = tmp_path / "cli-source", tmp_path / "cli-output"
     model.save_pretrained(source)
     (source / "generation_config.json").write_text(
@@ -303,7 +305,7 @@ def test_actual_cli_writes_five_stage_manifest(
     assert report["completion_status"] == "complete"
     assert report["algorithm_chain_complete"] is True
     assert report["full_reference_recipe"] is False
-    assert report["mtp"] == "disabled"
+    assert report["mtp"] == ("single-step" if with_mtp else "absent")
     assert report["numeric_contract"]["minmax_int8_denominator"] == 127
     assert report["calibration"]["samples"] == 1
     assert report["calibration"]["image_samples"] == int(
@@ -314,8 +316,32 @@ def test_actual_cli_writes_five_stage_manifest(
         8 if calibration_format == "messages" else 4
     )
     assert len(report["calibration"]["all_model_inputs_sha256"]) == 64
-    assert len(report["flex_smooth"]["results"]) == 3
-    assert report["projection_counts"] == dict(dense=3, routed=6, shared=3)
+    assert len(report["flex_smooth"]["results"]) == (5 if with_mtp else 3)
+    if with_mtp:
+        payload = {}
+        for shard in output.glob("model*.safetensors"):
+            payload.update(load_file(shard))
+        prefix = "model.language_model.layers.2"
+        assert f"{prefix}.mlp.experts.0.up_proj.weight_packed" in payload
+        assert (
+            payload[f"{prefix}.mlp.shared_experts.down_proj.weight"].dtype == torch.int8
+        )
+        assert f"{prefix}.mlp.experts.0.up_proj.weight" not in payload
+        assert payload["rot.weight"].shape == (32, 32)
+        config = json.loads((output / "config.json").read_text())
+        assert config["quantization_config"]["is_rot_used"] is True
+        from glm53_flash_ct_config import _matches
+
+        assert _matches(
+            "model.layers.2.mlp.experts.0.up_proj",
+            config["quantization_config"]["config_groups"]["routed"]["targets"],
+        )
+        assert json.loads((output / "config.json").read_text())["architectures"] == [
+            "Glm5NextForConditionalGeneration"
+        ]
+    assert report["projection_counts"] == dict(
+        dense=3, routed=12 if with_mtp else 6, shared=6 if with_mtp else 3
+    )
     assert GenerationConfig.from_pretrained(output).do_sample is True
     assert (
         json.loads((source / "generation_config.json").read_text())["do_sample"]
@@ -327,7 +353,9 @@ def test_actual_cli_writes_five_stage_manifest(
         "rot_uv",
         "rot_kv_b_proj",
     }
-    assert len(load_file(output / "glm53_flex_scales.safetensors")) == 3
+    assert len(load_file(output / "glm53_flex_scales.safetensors")) == (
+        5 if with_mtp else 3
+    )
 
 
 def test_streamed_search_keeps_global_statistics_and_native_grid(example_modules):
