@@ -1,10 +1,6 @@
 """Example-local GLM53 adapters for native QuaRot and FlexSmooth arithmetic.
 
-Topology reference: msmodelslim/model/glm_5_next/{quarot,model_adapter}.py at
-a18feb70d980b3e119f295d7e6accd524234e9c8 (Mulan PSL v2).
-No framework monkey patches, persistent forward hooks or renamed bare parameters.
-MTP is deliberately rejected: use the entrypoint's explicit disable-MTP policy
-for a backbone experiment, or ModelSlim for the reference including MTP.
+GLM53 backbone geometry; MTP requires a separate topology adapter.
 """
 
 import math
@@ -298,6 +294,7 @@ class Glm53QuaRotModifier(Modifier):
     _matrices: dict = PrivateAttr(default_factory=dict)
     _model: object = PrivateAttr(default=None)
     _applied: bool = PrivateAttr(default=False)
+    strict_recipe: bool = False
 
     @property
     def matrices(self):
@@ -357,6 +354,8 @@ class Glm53QuaRotModifier(Modifier):
                         precision=torch.float32,
                     )
                     matrix = self._matrices[op.space]
+                    if self.strict_recipe:
+                        matrix = matrix.to_dense()
                     updated = rotate_axis(
                         getattr(ref.owner, ref.key), matrix, **options
                     )
@@ -389,6 +388,7 @@ class Glm53FlexSmoothModifier(FlexSmoothModifier):
 
     subgraphs: tuple = ("norm-linear",)
     loss_chunk_tokens: int = Field(default=4096, strict=True, gt=0)
+    strict_recipe: bool = False
 
     def _preflight(self, model):
         if self.subgraphs != ("norm-linear",) or self.max_tokens is not None:
@@ -411,9 +411,22 @@ class Glm53FlexSmoothModifier(FlexSmoothModifier):
                 weights.append(getattr(ref.owner, ref.key).detach().clone())
         weight = torch.cat(weights)
         del weights
-        result, activation_max = streamed_flex_search(
-            self._cache[item.source], weight, self.loss_chunk_tokens
-        )
+        if self.strict_recipe:
+            # Match the reference's full cat/GEMM/mean, including BF16 rounding.
+            # Do not silently fall back to chunked moments on OOM.
+            activation = torch.cat(
+                [
+                    value.to(device=weight.device, dtype=weight.dtype)
+                    for value in self._cache[item.source]
+                ]
+            )
+            result = search_alpha_beta(activation, weight)
+            activation_max = activation.abs().amax(0)
+            del activation
+        else:
+            result, activation_max = streamed_flex_search(
+                self._cache[item.source], weight, self.loss_chunk_tokens
+            )
         scale = smooth_scale(
             activation_max, weight.abs().amax(0), result.alpha, result.beta
         )
@@ -429,7 +442,8 @@ class Glm53FlexSmoothModifier(FlexSmoothModifier):
             fallback=None,
             tokens_seen=self._seen[item.source],
             tokens_used=self._used[item.source],
-            loss_chunk_tokens=self.loss_chunk_tokens,
+            loss_chunk_tokens=None if self.strict_recipe else self.loss_chunk_tokens,
+            search_execution="full-tensor" if self.strict_recipe else "streamed",
             alpha_losses=list(result.alpha_losses),
             beta_losses=list(result.beta_losses),
         )

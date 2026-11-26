@@ -132,6 +132,43 @@ def test_real_quarot_flex_ssz_lifecycles_and_ct_export(tmp_path, example_modules
     )
 
 
+def test_bf16_smoothing_keeps_observed_outputs_for_downstream_statistics(
+    tmp_path, example_modules, monkeypatch
+):
+    preprocessing, example = example_modules
+    model, helper = tiny_glm(tmp_path)
+    model.bfloat16()
+    control, _ = tiny_glm(tmp_path / "control")
+    control.bfloat16().load_state_dict(model.state_dict())
+    expected = {}
+    captured = {}
+    original = preprocessing.Glm53FlexSmoothModifier
+
+    class ObserveOnly(original):
+        def _smooth(self, model, item):
+            expected[item.source] = torch.cat(self._cache[item.source]).clone()
+            self._processed.add(item.source)
+            self._cache.pop(item.source)
+
+    monkeypatch.setattr(preprocessing, "Glm53FlexSmoothModifier", ObserveOnly)
+    example.preprocess(control, helper.tiny_tokenizer(), helper.tiny_batches())
+
+    class InspectSmooth(original):
+        def _smooth(self, model, item):
+            captured[item.source] = torch.cat(self._cache[item.source]).clone()
+            super()._smooth(model, item)
+
+    monkeypatch.setattr(preprocessing, "Glm53FlexSmoothModifier", InspectSmooth)
+    example.preprocess(model, helper.tiny_tokenizer(), helper.tiny_batches())
+    actual = captured["model.language_model.layers.1.input_layernorm"]
+    torch.testing.assert_close(
+        actual,
+        expected["model.language_model.layers.1.input_layernorm"],
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_mtp_is_rejected_before_any_transform(tmp_path, example_modules, monkeypatch):
     preprocessing, example = example_modules
     model, _ = tiny_glm(tmp_path)
@@ -164,7 +201,10 @@ def test_raw_calibration_preserves_order_and_rejects_messages(
         example.read_raw_calibration(path)
 
 
-def test_actual_cli_writes_five_stage_manifest(tmp_path, example_modules, monkeypatch):
+@pytest.mark.parametrize("calibration_format", ["raw", "messages"])
+def test_actual_cli_writes_five_stage_manifest(
+    tmp_path, example_modules, monkeypatch, calibration_format
+):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
@@ -188,7 +228,56 @@ def test_actual_cli_writes_five_stage_manifest(tmp_path, example_modules, monkey
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=backend, unk_token="[UNK]", pad_token="[UNK]"
     )
-    monkeypatch.setattr(AutoProcessor, "from_pretrained", lambda *a, **kw: tokenizer)
+    processor = tokenizer
+    if calibration_format == "messages":
+        import struct
+        import zlib
+
+        image = tmp_path / "calib.png"
+
+        def png_chunk(tag, data):
+            return (
+                struct.pack(">I", len(data))
+                + tag
+                + data
+                + struct.pack(">I", zlib.crc32(tag + data))
+            )
+
+        image.write_bytes(
+            b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+            + png_chunk(
+                b"IDAT", zlib.compress((b"\x00" + bytes([120, 60, 40]) * 8) * 8)
+            )
+            + png_chunk(b"IEND", b"")
+        )
+        calibration.write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": image.name},
+                                {"type": "text", "text": "Describe this image"},
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+
+        class ImageProcessor:
+            def apply_chat_template(self, messages, **kwargs):
+                assert Path(messages[0]["content"][0]["image"]).is_file()
+                assert kwargs["truncation"] is False
+                return next(iter(helper.tiny_batches()))
+
+            def save_pretrained(self, output):
+                tokenizer.save_pretrained(output)
+
+        processor = ImageProcessor()
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", lambda *a, **kw: processor)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -200,6 +289,8 @@ def test_actual_cli_writes_five_stage_manifest(tmp_path, example_modules, monkey
             str(output),
             "--calibration-file",
             str(calibration),
+            "--calibration-format",
+            calibration_format,
             "--device",
             "cpu",
             "--step",
@@ -211,9 +302,18 @@ def test_actual_cli_writes_five_stage_manifest(tmp_path, example_modules, monkey
     report = json.loads((output / "calibration_report.json").read_text())
     assert report["completion_status"] == "complete"
     assert report["algorithm_chain_complete"] is True
-    assert report["full_modelslim_recipe"] is False
+    assert report["full_reference_recipe"] is False
     assert report["mtp"] == "disabled"
+    assert report["numeric_contract"]["minmax_int8_denominator"] == 127
     assert report["calibration"]["samples"] == 1
+    assert report["calibration"]["image_samples"] == int(
+        calibration_format == "messages"
+    )
+    assert report["calibration"]["format"] == calibration_format
+    assert report["calibration"]["total_input_tokens"] == (
+        8 if calibration_format == "messages" else 4
+    )
+    assert len(report["calibration"]["all_model_inputs_sha256"]) == 64
     assert len(report["flex_smooth"]["results"]) == 3
     assert report["projection_counts"] == dict(dense=3, routed=6, shared=3)
     assert GenerationConfig.from_pretrained(output).do_sample is True
@@ -256,3 +356,87 @@ def test_streamed_search_keeps_global_statistics_and_native_grid(example_modules
         atol=1e-7,
     )
     assert (actual.alpha, actual.beta) == (expected.alpha, expected.beta)
+
+
+def test_calibration_precheck_does_not_load_model_weights(
+    tmp_path, example_modules, monkeypatch, capsys
+):
+    import glm53_flash_w4a8c8_gptq_example as loader_module
+    from transformers import AutoProcessor
+
+    _, example = example_modules
+    _, helper = tiny_glm(tmp_path)
+    output = tmp_path / "check-output"
+    calibration = tmp_path / "raw.jsonl"
+    calibration.write_text('"one two three"\n')
+    monkeypatch.setattr(
+        AutoProcessor, "from_pretrained", lambda *a, **kw: helper.tiny_tokenizer()
+    )
+
+    def forbidden_load(*args, **kwargs):
+        raise AssertionError("Precheck must not load model weights")
+
+    monkeypatch.setattr(loader_module, "load_model", forbidden_load)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "example",
+            "--model",
+            str(tmp_path / "source"),
+            "--save-dir",
+            str(output),
+            "--calibration-file",
+            str(calibration),
+            "--device",
+            "cpu",
+            "--calibration-check-only",
+        ],
+    )
+    capsys.readouterr()
+    example.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report["calibration_check"] == "passed"
+    assert report["calibration"]["samples"] == 1
+    assert not output.exists()
+    assert not output.with_name(output.name + "-offload").exists()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_weight_qparams_codes_survive_native_ct_export(
+    tmp_path, example_modules, dtype
+):
+    from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+    from glm53_flash_quantization import weight_qparams
+    from glm53_flash_w4a8c8_ssz_example import quantize_mlp, validate_export
+
+    _, example = example_modules
+    model, helper = tiny_glm(tmp_path)
+    model.to(dtype)
+    example.preprocess(model, helper.tiny_tokenizer(), helper.tiny_batches())
+    expected = {}
+    for name, module in model.named_modules():
+        if (
+            name.startswith("model.language_model.layers.")
+            and ".mlp." in name
+            and name.endswith(("gate_proj", "up_proj", "down_proj"))
+        ):
+            bits, method = (4, "ssz") if ".experts." in name else (8, "minmax")
+            expected[name] = weight_qparams(module.weight, bits, method, step=3)
+    scope = quantize_mlp(model, helper.tiny_tokenizer(), step=3, strict_recipe=True)
+    output = tmp_path / "reference-ct"
+    model.save_pretrained(output, save_compressed=True)
+    validate_export(output, scope, repair=True)
+    payload = {}
+    for shard in output.glob("model*.safetensors"):
+        payload.update(load_file(shard))
+    for name, (scale, codes) in expected.items():
+        torch.testing.assert_close(
+            payload[f"{name}.weight_scale"], scale, rtol=0, atol=0
+        )
+        if ".experts." in name:
+            shape = torch.Size(payload[f"{name}.weight_shape"].tolist())
+            actual = unpack_from_int32(payload[f"{name}.weight_packed"], 4, shape)
+        else:
+            actual = payload[f"{name}.weight"]
+        torch.testing.assert_close(actual, codes, rtol=0, atol=0)

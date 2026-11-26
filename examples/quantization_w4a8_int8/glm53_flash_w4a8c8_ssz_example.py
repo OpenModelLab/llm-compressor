@@ -1,6 +1,6 @@
 """GLM-5.3-Flash SSZ control: routed W4A8, dense/shared W8A8 MinMax.
 
-This is the quantization-only control for the ModelSlim recipe, not its full
+This is the quantization-only control for the reference recipe, not its full
 QuaRot/FlexSmooth reproduction. No activation samples or forward passes are used.
 Keep the GPTQ loader and CT metadata auditor in this directory.
 For the preprocessing chain, see glm53_flash_w4a8c8_quarot_flex_ssz_example.py;
@@ -127,7 +127,7 @@ def validate_export(output, scope, *, repair=False):
     return audit
 
 
-def quantize_mlp(model, processor, step=50):
+def quantize_mlp(model, processor, step=50, *, strict_recipe=False):
     """Apply the YAML's three weight quantizers through native data-free oneshot."""
     from compressed_tensors.offload import OffloadCache
 
@@ -138,6 +138,10 @@ def quantize_mlp(model, processor, step=50):
     if any(getattr(m, "quantization_scheme", None) for m in model.modules()):
         raise ValueError("Start from an unquantized floating model")
     groups = make_ssz_groups(model.config.get_text_config().num_hidden_layers, step)
+    if strict_recipe:
+        from glm53_flash_quantization import strict_groups
+
+        groups = strict_groups(model.config.get_text_config().num_hidden_layers, step)
     expected = expected_mlp_projections(model.config.to_dict())
     modules = quantized_modules(model, groups)
     missing, extra = (
@@ -163,7 +167,15 @@ def quantize_mlp(model, processor, step=50):
         )
         counts[family] += 1
     timings = {}
-    modifiers = build_modifiers(groups, step)
+    if strict_recipe:
+        from llmcompressor.modifiers.quantization import QuantizationModifier
+
+        modifiers = {
+            family: QuantizationModifier(config_groups={family: groups[family]})
+            for family in groups
+        }
+    else:
+        modifiers = build_modifiers(groups, step)
     model.eval()
     for family in ("dense", "routed", "shared"):
         if not counts[family]:
@@ -308,7 +320,7 @@ def main():
     report = dict(
         completion_status="complete",
         algorithm="SSZ routed + MinMax dense/shared",
-        full_modelslim_recipe=False,
+        full_reference_recipe=False,
         quarot=False,
         flex_smooth=False,
         calibration_data_required=False,

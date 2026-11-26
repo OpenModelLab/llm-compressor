@@ -157,7 +157,7 @@ def test_cli_source_preflight_and_completed_export(tmp_path, monkeypatch, capsys
     example.main()
     report = json.loads((output / "calibration_report.json").read_text())
     assert report["completion_status"] == "complete"
-    assert report["full_modelslim_recipe"] is False
+    assert report["full_reference_recipe"] is False
     assert report["projection_counts"] == dict(dense=3, routed=6, shared=3)
     assert report["source_files_sha256"]["generation_config.json"]
     assert report["environment"]["imported_modules"]["llmcompressor"]
